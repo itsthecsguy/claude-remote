@@ -68,6 +68,7 @@ export type InstallReport = {
   tunnelPlist: string;
   hookEvents: string[];
   hooks: SettingsEdit | null;
+  tunnelReloaded: boolean;
 };
 
 export type StatusReport = {
@@ -187,6 +188,7 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
     tunnelPlist: renderTunnelPlist(input),
     hookEvents: input.hooks === false ? [] : Object.keys(planFor(input)),
     hooks: null,
+    tunnelReloaded: false,
   };
   if (input.dryRun) return report;
   await hooks.build();
@@ -199,14 +201,21 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
   await ensureLog(helperLogPath(input.home));
   await ensureLog(tunnelLogPath(input.home));
   await writePrivate(report.httpPlistPath, report.httpPlist, "launchAgents");
+  const previousTunnel = await readPlainFile(report.tunnelPlistPath);
   await writePrivate(report.tunnelPlistPath, report.tunnelPlist, "launchAgents");
   const domain = `gui/${input.uid}`;
+  // A quick tunnel gets a new hostname every time it starts, so leave a loaded tunnel with an
+  // unchanged plist running. The helper always reloads, to pick up the new build.
+  const tunnelLoaded = (await hooks.run(input.launchctlBin, ["print", `${domain}/${TUNNEL_LABEL}`])).code === 0;
+  report.tunnelReloaded = !(tunnelLoaded && previousTunnel === report.tunnelPlist);
   await hooks.run(input.launchctlBin, ["bootout", `${domain}/${HTTP_LABEL}`]);
-  await hooks.run(input.launchctlBin, ["bootout", `${domain}/${TUNNEL_LABEL}`]);
+  if (report.tunnelReloaded) await hooks.run(input.launchctlBin, ["bootout", `${domain}/${TUNNEL_LABEL}`]);
   const httpBoot = await hooks.run(input.launchctlBin, ["bootstrap", domain, report.httpPlistPath]);
   if (httpBoot.code !== 0) throw new DeskError("launchctl-failed", "http helper did not load");
-  const tunnelBoot = await hooks.run(input.launchctlBin, ["bootstrap", domain, report.tunnelPlistPath]);
-  if (tunnelBoot.code !== 0) throw new DeskError("launchctl-failed", "tunnel did not load");
+  if (report.tunnelReloaded) {
+    const tunnelBoot = await hooks.run(input.launchctlBin, ["bootstrap", domain, report.tunnelPlistPath]);
+    if (tunnelBoot.code !== 0) throw new DeskError("launchctl-failed", "tunnel did not load");
+  }
   await registerChannel(input, hooks);
   if (input.hooks !== false) {
     report.hooks = await installHooks(input.configRoot ?? path.join(input.home, ".claude"), planFor(input), input.now);
@@ -354,6 +363,16 @@ export async function ensureLog(file: string): Promise<void> {
   }
   await handle.close();
   await chmod(file, 0o600);
+}
+
+async function readPlainFile(file: string): Promise<string | null> {
+  try {
+    const info = await lstat(file);
+    if (!info.isFile()) return null;
+    return await readFile(file, "utf8");
+  } catch {
+    return null;
+  }
 }
 
 async function registerChannel(input: InstallInput, hooks: InstallHooks): Promise<void> {

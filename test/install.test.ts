@@ -78,8 +78,14 @@ test("install is idempotent, and uninstall leaves user data unless purged", asyn
   assert.equal(JSON.stringify(first).includes(token), false);
   assert.equal(recorded.calls.some((line) => line.includes("install cloudflared")), true);
   assert.equal(recorded.calls.some((line) => line.includes("mcp add")), true);
+  assert.equal(first.tunnelReloaded, true);
   const second = await executeInstall(input(home), recorded.hooks);
   assert.equal(await readToken(home), token);
+  assert.equal(second.tunnelReloaded, false);
+  const tunnelBoots = recorded.calls.filter((line) => line.includes("bootstrap") && line.includes("com.claude-remote.tunnel"));
+  assert.equal(tunnelBoots.length, 1, "an unchanged plist with a loaded tunnel keeps the tunnel running");
+  const moved = await executeInstall(input(home, { port: 47399 }), recorded.hooks);
+  assert.equal(moved.tunnelReloaded, true);
   assert.equal(second.httpPlist.includes(token), false);
   const adds = recorded.calls.filter((line) => line.includes(" mcp add "));
   assert.equal(adds.length, 1);
