@@ -46,6 +46,9 @@ export type PermissionAnswer = { behavior: "allow" | "deny"; message?: string };
 export type QuestionAnswer = { answers: Record<string, string> };
 export type HookDecision = { kind: "permission"; answer: PermissionAnswer } | { kind: "question"; answer: QuestionAnswer };
 
+/** An entry was added to or removed from the store. */
+export type PendingChange = { type: "added" | "removed"; view: PendingView };
+
 export type WaitResult =
   | { state: "decided"; decision: HookDecision }
   | { state: "pending" }
@@ -79,6 +82,7 @@ const CLEAR_MATCH_EVENTS = new Set(["PostToolUse", "PostToolUseFailure", "Permis
 
 export class PendingStore {
   private readonly entries = new Map<string, Entry>();
+  private readonly listeners = new Set<(change: PendingChange) => void>();
 
   constructor(private readonly clock: () => number = Date.now) {}
 
@@ -248,6 +252,24 @@ export class PendingStore {
     return this.entries.size;
   }
 
+  /** Observe entries being added and removed. A throwing listener is ignored. Returns an unsubscribe. */
+  subscribe(listener: (change: PendingChange) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emit(change: PendingChange): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(change);
+      } catch {
+        // a listener must never break hook handling
+      }
+    }
+  }
+
   private answerable(entry: Entry, now: number): boolean {
     return entry.decision === null
       && entry.deadlineMs !== null
@@ -278,6 +300,7 @@ export class PendingStore {
       lastSeenMs: now,
       delivered: false,
     });
+    this.emit({ type: "added", view: { ...this.entries.get(requestId)!.view } });
     while (this.entries.size > MAX_ENTRIES) {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;
@@ -297,6 +320,7 @@ export class PendingStore {
     if (!entry) return;
     this.entries.delete(id);
     for (const waiter of [...entry.waiters]) waiter({ state: "gone" });
+    this.emit({ type: "removed", view: { ...entry.view } });
   }
 
   private sweep(now: number): void {
