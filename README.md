@@ -1,5 +1,7 @@
 # claude-remote
 
+[![ci](https://github.com/itsthecsguy/claude-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/itsthecsguy/claude-remote/actions/workflows/ci.yml)
+
 claude-remote lists Claude Code sessions on this Mac, including sessions started from the Code tab in the Claude desktop app. When send is turned on, it can resume one session through the `claude` CLI. `claude-remote http` serves the same methods on `127.0.0.1`. Each request gets one JSON body. The listener does not use server-sent events.
 
 claude-remote is an unofficial, community-built tool. It is not affiliated with, endorsed by, or supported by Anthropic. Claude and Claude Code are trademarks of Anthropic.
@@ -268,6 +270,8 @@ npm test
 ```
 
 `npm test` typechecks and runs the unit tests, including a clean-machine check that starts the HTTP server with an empty `HOME` and expects `initialize` plus `list_sessions` to return an empty list.
+
+CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run build`, `npm test`, and `npm run test:portable` on macOS and Ubuntu with Node 20, 22, and 24, on every push and pull request. It has read-only repository access and uses no secrets.
 
 ## License
 
