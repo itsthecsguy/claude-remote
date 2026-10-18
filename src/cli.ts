@@ -17,6 +17,8 @@ import {
   type UninstallReport,
 } from "./install.js";
 import { BlockedByDialog, startContinue, startNew, stopLaunched, UnobservedLaunch, type StartResult } from "./launch.js";
+import { pendingFilePath, registryLiveness, startPendingPersistence } from "./pending-file.js";
+import { pendingStore } from "./pending.js";
 import { listRows, type DeskRow } from "./rows.js";
 import { showSession, type ShowView } from "./show.js";
 import { mintToken, tokenPath, writeToken } from "./token.js";
@@ -129,11 +131,16 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
     }
     case "http": {
       const port = resolveHttpPort(env, parsed.port);
+      const saved = await startPendingPersistence(pendingStore, {
+        file: pendingFilePath(config.home),
+        approveTimeoutMs: config.approveTimeoutMs,
+        liveness: registryLiveness(config),
+      });
       const listener = await listenHttp(config, port);
       io.stdout(`listening=${HTTP_HOST}:${listener.port}\ntokenPath=${tokenPath(config.home)}\n`);
       await new Promise<void>((resolve) => {
         const stop = () => {
-          void listener.close().finally(resolve);
+          void listener.close().then(() => saved.stop()).finally(resolve);
         };
         process.once("SIGINT", stop);
         process.once("SIGTERM", stop);
