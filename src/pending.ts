@@ -8,7 +8,8 @@ import { logEvent } from "./log.js";
 /**
  * Pending attention reported by Claude Code hooks (see `claude-remote hook`).
  *
- * Entries live in this process's memory only. They are never written to disk or to the log,
+ * Entries live in this process's memory. The HTTP helper also saves them to a 0600 file in the
+ * state dir (see pending-file.ts) so a restart keeps them. They are never written to the log,
  * because they carry question, notification and tool-input text. Authenticated MCP clients can
  * read them through list_sessions, get_session and list_pending.
  *
@@ -30,6 +31,7 @@ export type PendingView = {
   requestId: string;
   sessionId: string;
   agentId: string | null;
+  projectName: string | null;
   kind: PendingKind;
   createdAt: string;
   expiresAt: string | null;
@@ -46,6 +48,9 @@ export type PermissionAnswer = { behavior: "allow" | "deny"; message?: string };
 export type QuestionAnswer = { answers: Record<string, string> };
 export type HookDecision = { kind: "permission"; answer: PermissionAnswer } | { kind: "question"; answer: QuestionAnswer };
 
+/** An entry was added to or removed from the store. */
+export type PendingChange = { type: "added" | "removed"; view: PendingView };
+
 export type WaitResult =
   | { state: "decided"; decision: HookDecision }
   | { state: "pending" }
@@ -60,6 +65,13 @@ type Entry = {
   waiters: Set<(result: WaitResult) => void>;
   lastSeenMs: number;
   delivered: boolean;
+};
+
+/** One entry as saved to disk. Waiters, decisions and answerability are not saved. */
+export type SavedEntry = {
+  view: PendingView;
+  createdMs: number;
+  matchKey: string | null;
 };
 
 const MAX_ENTRIES = 500;
@@ -79,6 +91,7 @@ const CLEAR_MATCH_EVENTS = new Set(["PostToolUse", "PostToolUseFailure", "Permis
 
 export class PendingStore {
   private readonly entries = new Map<string, Entry>();
+  private readonly listeners = new Set<(change: PendingChange) => void>();
 
   constructor(private readonly clock: () => number = Date.now) {}
 
@@ -94,6 +107,7 @@ export class PendingStore {
     const name = typeof event.hook_event_name === "string" ? event.hook_event_name : "";
     if (!sessionId) return none;
     const agentId = safeId(event.agent_id);
+    const projectName = projectNameOf(event.cwd);
     const now = this.clock();
     this.sweep(now);
     if (CLEAR_ALL_EVENTS.has(name)) {
@@ -117,6 +131,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "notification",
         toolName: null,
         notificationType: typeof event.notification_type === "string" ? clip(event.notification_type, 64) : null,
@@ -133,6 +148,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "permission",
         toolName,
         notificationType: null,
@@ -151,6 +167,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "question",
         toolName,
         notificationType: null,
@@ -230,6 +247,41 @@ export class PendingStore {
     return out;
   }
 
+  /** Entries in a form that can be saved, oldest first. */
+  snapshot(): SavedEntry[] {
+    return [...this.entries.values()].map((entry) => ({ view: { ...entry.view }, createdMs: entry.createdMs, matchKey: entry.matchKey }));
+  }
+
+  /**
+   * Put saved entries back after a restart. A restored entry is never answerable: the hook that
+   * was waiting for it gave up when the helper went away, and the prompt fell back to the app or
+   * terminal. Restoring does not notify observers. Returns how many entries were restored.
+   */
+  restore(saved: readonly SavedEntry[]): number {
+    let count = 0;
+    for (const item of saved) {
+      const view = item.view;
+      if (this.entries.has(view.requestId) || !REQUEST_RE.test(view.requestId)) continue;
+      this.entries.set(view.requestId, {
+        view: { ...view, answerable: false, expiresAt: null },
+        createdMs: item.createdMs,
+        deadlineMs: null,
+        matchKey: item.matchKey,
+        decision: null,
+        waiters: new Set(),
+        lastSeenMs: item.createdMs,
+        delivered: false,
+      });
+      count += 1;
+    }
+    while (this.entries.size > MAX_ENTRIES) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
+    }
+    return count;
+  }
+
   /** Drop entries a status change shows are over. */
   reconcile(sessionId: string, status: string): void {
     const now = this.clock();
@@ -246,6 +298,24 @@ export class PendingStore {
 
   size(): number {
     return this.entries.size;
+  }
+
+  /** Observe entries being added and removed. A throwing listener is ignored. Returns an unsubscribe. */
+  subscribe(listener: (change: PendingChange) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emit(change: PendingChange): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(change);
+      } catch {
+        // a listener must never break hook handling
+      }
+    }
   }
 
   private answerable(entry: Entry, now: number): boolean {
@@ -278,6 +348,7 @@ export class PendingStore {
       lastSeenMs: now,
       delivered: false,
     });
+    this.emit({ type: "added", view: { ...this.entries.get(requestId)!.view } });
     while (this.entries.size > MAX_ENTRIES) {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;
@@ -297,6 +368,7 @@ export class PendingStore {
     if (!entry) return;
     this.entries.delete(id);
     for (const waiter of [...entry.waiters]) waiter({ state: "gone" });
+    this.emit({ type: "removed", view: { ...entry.view } });
   }
 
   private sweep(now: number): void {
@@ -312,6 +384,12 @@ export const pendingStore = new PendingStore();
 function safeId(value: unknown): string | null {
   if (typeof value !== "string" || !ID_RE.test(value)) return null;
   return value.toLowerCase();
+}
+
+function projectNameOf(cwd: unknown): string | null {
+  if (typeof cwd !== "string" || cwd.length === 0 || cwd.length > 4096) return null;
+  const name = cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+  return name.length > 0 ? clip(name, 200) : null;
 }
 
 function clip(value: string, max: number): string {
@@ -418,7 +496,7 @@ export function attachPending<T extends { sessionId: string; status: { value: st
   return { ...card, pending: store.list({ sessionId: card.sessionId }).slice(0, 10) };
 }
 
-const LIST_PENDING_DESCRIPTION = "List what live sessions are waiting on, as reported by the claude-remote Claude Code hooks: permission requests (tool name and a summary of the tool input), AskUserQuestion questions (question text and options), and notifications (message text and notification_type, such as idle_prompt or permission_prompt). Entries are kept in the helper's memory only and are cleared when the session moves on (the next prompt, tool result, or stop) or stops running. answerable is true while a hook is still waiting for a remote answer; answer it with answer_permission or answer_question when those tools are enabled, otherwise answer in the app or terminal. Empty when the hooks are not installed.";
+const LIST_PENDING_DESCRIPTION = "List what live sessions are waiting on, as reported by the claude-remote Claude Code hooks: permission requests (tool name and a summary of the tool input), AskUserQuestion questions (question text and options), and notifications (message text and notification_type, such as idle_prompt or permission_prompt). Entries are kept in the helper's memory and in a private file in its state dir, so they survive a helper restart (restored entries are never answerable), and are cleared when the session moves on (the next prompt, tool result, or stop) or stops running. answerable is true while a hook is still waiting for a remote answer; answer it with answer_permission or answer_question when those tools are enabled, otherwise answer in the app or terminal. Empty when the hooks are not installed.";
 
 const ANSWER_PERMISSION_DESCRIPTION = "Answer one pending permission request from list_pending. Requires CLAUDE_REMOTE_ALLOW_APPROVE=1 and confirm set to true. decision is allow or deny for this single request only: it never adds a permission rule, never changes the permission mode, and never edits the tool input. Deny and ask rules in the session's settings still apply after an allow. message is passed to Claude with a deny. Fails when no hook is waiting any more (the request timed out to the normal prompt, or was answered locally). The message is not logged.";
 

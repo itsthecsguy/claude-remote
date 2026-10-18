@@ -13,8 +13,10 @@ import {
 import type { Config } from "./config.js";
 import { DeskError } from "./domain.js";
 import { registerDeliverTool } from "./deliver.js";
+import { decisionOutput } from "./hook.js";
 import { registerLaunchTools } from "./launch.js";
 import { logEvent } from "./log.js";
+import { loadNotifySettings, startNotifier } from "./notify.js";
 import { pendingStore, registerPendingTools } from "./pending.js";
 import { bearerMatches, readToken } from "./token.js";
 import { registerTools } from "./tools.js";
@@ -35,7 +37,7 @@ export type HttpListener = {
   close: () => Promise<void>;
 };
 
-export async function listenHttp(config: Config, port = HTTP_PORT): Promise<HttpListener> {
+export async function listenHttp(config: Config, port = HTTP_PORT, options: { env?: NodeJS.ProcessEnv } = {}): Promise<HttpListener> {
   if (port < 0 || port > 65535) throw new DeskError("usage", "port is not allowed");
   const modern = createMcpHandler(deskFactory(config), {
     legacy: "reject",
@@ -56,9 +58,12 @@ export async function listenHttp(config: Config, port = HTTP_PORT): Promise<Http
     server.close();
     throw new DeskError("denied", "http listener must bind to 127.0.0.1");
   }
+  const notify = await loadNotifySettings(options.env ?? process.env, config.home);
+  const alerts = notify ? startNotifier(pendingStore, notify) : null;
   return {
     port: address.port,
     close: () => new Promise((resolve, reject) => {
+      alerts?.stop();
       server.closeAllConnections();
       server.close((error) => error ? reject(error) : resolve());
     }),
@@ -123,7 +128,7 @@ async function onRequest(
   }
   const method = req.method ?? "GET";
   if (HOOK_PATHS.has(url.pathname)) {
-    await onHookRequest(config, url.pathname, method, req, res, body);
+    await onHookRequest(config, url, method, req, res, body);
     return;
   }
   if (method === "POST" && !isJsonContentType(oneHeader(req.headers["content-type"]))) {
@@ -164,10 +169,15 @@ async function onRequest(
  * Endpoints for `claude-remote hook`. They take the same bearer token, and they refuse any request
  * that came through a tunnel (Cloudflare adds forwarding headers), so only a hook process on this
  * machine can register events or wait for answers. Bodies are never logged.
+ *
+ * With ?format=text they answer the sh hook in plain text instead of JSON: /hook/event says
+ * "wait <requestId> <waitMs>" or "ok", and /hook/wait says "pending", "gone", or
+ * "decided <hook output JSON>", built by the same decisionOutput the Node hook uses from the
+ * hook input the script sends along with each wait.
  */
 async function onHookRequest(
   config: Config,
-  pathname: string,
+  url: URL,
   method: string,
   req: IncomingMessage,
   res: ServerResponse,
@@ -195,21 +205,42 @@ async function onHookRequest(
     json(res, 400, { error: "bad-json" });
     return;
   }
+  const pathname = url.pathname;
+  const text = url.searchParams.get("format") === "text";
   if (pathname === HOOK_EVENT_PATH) {
     const result = pendingStore.record(parsed, { allowApprove: config.allowApprove, waitMs: config.approveTimeoutMs });
     const name = parsed && typeof parsed === "object" ? (parsed as { hook_event_name?: unknown }).hook_event_name : null;
     logEvent({ tool: "hook", evidence: typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? name : "unknown", code: result.wait ? "wait" : "recorded" });
+    if (text) {
+      plain(res, result.wait && result.requestId ? `wait ${result.requestId} ${result.waitMs}` : "ok");
+      return;
+    }
     json(res, 200, result);
     return;
   }
-  const request = parsed && typeof parsed === "object" ? parsed as { requestId?: unknown; sliceMs?: unknown } : {};
+  const request = parsed && typeof parsed === "object" ? parsed as { requestId?: unknown; sliceMs?: unknown; input?: unknown } : {};
   const requestId = typeof request.requestId === "string" ? request.requestId : "";
   const sliceMs = typeof request.sliceMs === "number" && Number.isFinite(request.sliceMs) ? request.sliceMs : 0;
   const abort = new AbortController();
   res.on("close", () => abort.abort());
   const result = await pendingStore.wait(requestId, sliceMs, abort.signal);
   if (res.writableEnded || res.destroyed) return;
+  if (text) {
+    const input = request.input;
+    if (result.state !== "decided") {
+      plain(res, result.state);
+      return;
+    }
+    const out = input && typeof input === "object" && !Array.isArray(input) ? decisionOutput(input as Record<string, unknown>, result.decision) : "";
+    plain(res, out ? `decided ${out}` : "gone");
+    return;
+  }
   json(res, 200, result);
+}
+
+function plain(res: ServerResponse, body: string): void {
+  res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+  res.end(`${body}\n`);
 }
 
 function deskFactory(config: Config): () => McpServer {

@@ -11,11 +11,14 @@ import {
   serverEntry,
   resolveClaudeBin,
   stableNodeBin,
+  type InstallInput,
   type InstallReport,
   type StatusReport,
   type UninstallReport,
 } from "./install.js";
 import { BlockedByDialog, startContinue, startNew, stopLaunched, UnobservedLaunch, type StartResult } from "./launch.js";
+import { pendingFilePath, registryLiveness, startPendingPersistence } from "./pending-file.js";
+import { pendingStore } from "./pending.js";
 import { listRows, type DeskRow } from "./rows.js";
 import { showSession, type ShowView } from "./show.js";
 import { mintToken, tokenPath, writeToken } from "./token.js";
@@ -38,10 +41,12 @@ type Parsed =
   | { command: "stop"; json: boolean; sessionId?: string; target?: string }
   | { command: "cleanup"; json: boolean }
   | { command: "http"; port?: number }
-  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; approveTimeoutS?: number; hooks: boolean; port?: number }
+  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags }
   | { command: "uninstall"; json: boolean; dryRun: boolean; purge: boolean }
   | { command: "status"; json: boolean }
   | { command: "rotate-token"; json: boolean };
+
+type NotifyFlags = { url?: string; secret?: string; auth?: string; includeText: boolean; cleared: boolean };
 
 type Io = {
   stdout: (text: string) => void;
@@ -126,11 +131,16 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
     }
     case "http": {
       const port = resolveHttpPort(env, parsed.port);
+      const saved = await startPendingPersistence(pendingStore, {
+        file: pendingFilePath(config.home),
+        approveTimeoutMs: config.approveTimeoutMs,
+        liveness: registryLiveness(config),
+      });
       const listener = await listenHttp(config, port);
       io.stdout(`listening=${HTTP_HOST}:${listener.port}\ntokenPath=${tokenPath(config.home)}\n`);
       await new Promise<void>((resolve) => {
         const stop = () => {
-          void listener.close().finally(resolve);
+          void listener.close().then(() => saved.stop()).finally(resolve);
         };
         process.once("SIGINT", stop);
         process.once("SIGTERM", stop);
@@ -151,6 +161,7 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         allowApprove: parsed.allowApprove,
         approveTimeoutS: parsed.approveTimeoutS ?? approveTimeoutSeconds(env.CLAUDE_REMOTE_APPROVE_TIMEOUT_S),
         hooks: parsed.hooks,
+        notify: notifyInput(parsed.notify, env),
         configRoot: config.configRoot,
         dryRun: parsed.dryRun,
         nodeBin,
@@ -376,7 +387,12 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
   let hooks = true;
   let purge = false;
   let port: number | undefined;
+  const notify: NotifyFlags = { includeText: false, cleared: false };
   for (const token of argv) {
+    if (command === "install" && token.startsWith("--notify-")) {
+      readNotifyFlag(notify, token);
+      continue;
+    }
     if (token === "--json") json = true;
     else if (token === "--dry-run") dryRun = true;
     else if (token === "--allow-send") allowSend = true;
@@ -394,7 +410,8 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
       return { command, port };
     case "install":
       if (purge) throw new DeskError("usage", USAGE);
-      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, approveTimeoutS, hooks, port };
+      if (!notify.url && (notify.secret || notify.auth || notify.includeText || notify.cleared)) throw new DeskError("usage", USAGE);
+      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, approveTimeoutS, hooks, port, notify };
     case "uninstall":
       if (allowSend || allowLaunch || port != null) throw new DeskError("usage", USAGE);
       return { command, json, dryRun, purge };
@@ -409,6 +426,31 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
       return assertNever(_never);
     }
   }
+}
+
+function readNotifyFlag(notify: NotifyFlags, token: string): void {
+  const eq = token.indexOf("=");
+  const flag = eq === -1 ? token : token.slice(0, eq);
+  const value = eq === -1 ? undefined : token.slice(eq + 1);
+  if (flag === "--notify-url" && value) notify.url = value;
+  else if (flag === "--notify-secret" && value) notify.secret = value;
+  else if (flag === "--notify-auth" && (value === "hmac" || value === "bearer")) notify.auth = value;
+  else if (flag === "--notify-include-text" && value === undefined) notify.includeText = true;
+  else if (flag === "--notify-cleared" && value === undefined) notify.cleared = true;
+  else throw new DeskError("usage", USAGE);
+}
+
+// The secret can come from the environment so it stays out of the process list and shell history.
+function notifyInput(flags: NotifyFlags, env: NodeJS.ProcessEnv): InstallInput["notify"] {
+  if (!flags.url) return null;
+  const secret = flags.secret ?? (env.CLAUDE_REMOTE_NOTIFY_SECRET || undefined);
+  return {
+    url: flags.url,
+    ...(secret ? { secret } : {}),
+    ...(flags.auth === "bearer" || flags.auth === "hmac" ? { auth: flags.auth } : {}),
+    ...(flags.includeText ? { includeText: true } : {}),
+    ...(flags.cleared ? { cleared: true } : {}),
+  };
 }
 
 function parseApproveTimeout(raw: string): number {
@@ -442,6 +484,7 @@ function installText(report: InstallReport): string {
     `settings=${report.hooks ? report.hooks.settingsPath : "-"}`,
     `settingsChanged=${report.hooks ? (report.hooks.changed ? "yes" : "no") : "-"}`,
     `settingsBackup=${report.hooks?.backupPath ?? "-"}`,
+    `notify=${report.notify ? `${report.notify.url} signed=${report.notify.signed ? "yes" : "no"} text=${report.notify.includeText ? "yes" : "no"}` : "-"}`,
     report.httpPlist,
     report.tunnelPlist,
   ].join("\n") + "\n";
