@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { DeskError, assertNever } from "./domain.js";
+import { removeHookScript, writeHookScript } from "./hook-script.js";
 import { HTTP_HOST, HTTP_PORT } from "./http.js";
 import { assertSpawnAllowed } from "./launch.js";
 import { ensureToken, tokenDirectory, tokenPath } from "./token.js";
@@ -70,6 +71,7 @@ export type InstallReport = {
   httpPlist: string;
   tunnelPlist: string;
   hookEvents: string[];
+  hookScript: string | null;
   hooks: SettingsEdit | null;
   tunnelReloaded: boolean;
   notify: { url: string; signed: boolean; auth: string; includeText: boolean; cleared: boolean } | null;
@@ -198,6 +200,7 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
     httpPlist: renderHttpPlist(input),
     tunnelPlist: renderTunnelPlist(input),
     hookEvents: input.hooks === false ? [] : Object.keys(planFor(input)),
+    hookScript: null,
     hooks: null,
     tunnelReloaded: false,
     notify: checkNotifyInput(input.notify) ? {
@@ -239,7 +242,10 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
   }
   await registerChannel(input, hooks);
   if (input.hooks !== false) {
-    report.hooks = await installHooks(input.configRoot ?? path.join(input.home, ".claude"), planFor(input), input.now);
+    // Each event runs a small sh script that talks to the helper with curl, instead of starting Node.
+    report.hookScript = await writeHookScript(input.home, input.nodeBin, input.entry);
+    const plan = hookPlan(input.nodeBin, input.entry, input.approveTimeoutS ?? DEFAULT_APPROVE_TIMEOUT_S, report.hookScript);
+    report.hooks = await installHooks(input.configRoot ?? path.join(input.home, ".claude"), plan, input.now);
   }
   report.url = await waitForUrl(input.home, input.urlWaitMs);
   return report;
@@ -286,6 +292,7 @@ export async function executeUninstall(
   for (const file of removed) await unlinkFile(file);
   await hooks.run(input.claudeBin, ["mcp", "remove", "--scope", "user", "claude-remote-channel"]);
   const settings = await uninstallHooks(configRoot, input.now);
+  await removeHookScript(input.home);
   if (input.purge) {
     for (const name of ["attachments", "queue", "inbox", "launches", "c", "channel", "mcp", "http", "tunnel"]) {
       await rmTreeSafe(path.join(input.home, ".claude-remote", name));

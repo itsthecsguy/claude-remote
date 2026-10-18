@@ -19,12 +19,14 @@ type Group = { matcher?: string; hooks: Handler[] } & Record<string, unknown>;
 
 export type HookPlan = Record<string, Group[]>;
 
-/** The hook groups install adds. waitS is the helper's remote-answer timeout in seconds. */
-export function hookPlan(nodeBin: string, entry: string, waitS: number): HookPlan {
+/**
+ * The hook groups install adds. waitS is the helper's remote-answer timeout in seconds. With a
+ * script path the handlers run the sh hook (`/bin/sh <script>`); without one they run the Node hook.
+ */
+export function hookPlan(nodeBin: string, entry: string, waitS: number, script?: string): HookPlan {
   const handler = (extra: Record<string, unknown>): Handler => ({
     type: "command",
-    command: nodeBin,
-    args: [entry, "hook", HOOK_MARKER],
+    ...(script ? { command: "/bin/sh", args: [script, HOOK_MARKER] } : { command: nodeBin, args: [entry, "hook", HOOK_MARKER] }),
     ...extra,
   });
   const waiting = { timeout: waitS + 15 };
