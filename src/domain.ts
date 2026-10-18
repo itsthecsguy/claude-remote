@@ -1,3 +1,4 @@
+import type { PendingView } from "./pending.js";
 export type SessionId = string & { readonly __brand: "SessionId" };
 
 export type DesktopSessionId = string & { readonly __brand: "DesktopSessionId" };
@@ -27,6 +28,7 @@ export type SessionCard = {
   process: ProcessDetailsView | null;
   subSessions: SubSessionRow[];
   subSessionCount: number;
+  pending?: PendingView[];
 };
 
 export type WaitingFor =

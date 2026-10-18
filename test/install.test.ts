@@ -44,6 +44,10 @@ test("dry-run returns both plists and writes nothing", async () => {
   assert.match(report.httpPlist, /CLAUDE_REMOTE_ALLOW_LAUNCH<\/key><string>0<\/string>/);
   assert.match(report.httpPlist, /CLAUDE_REMOTE_CLAUDE_BIN<\/key><string>\/fake\/claude<\/string>/);
   assert.equal(report.httpPlist.includes("CLAUDE_REMOTE_ALLOW_DELIVER"), false);
+  assert.match(report.httpPlist, /CLAUDE_REMOTE_ALLOW_APPROVE<\/key><string>0<\/string>/);
+  assert.match(report.httpPlist, /CLAUDE_REMOTE_APPROVE_TIMEOUT_S<\/key><string>120<\/string>/);
+  assert.ok(report.hookEvents.includes("PermissionRequest"));
+  assert.equal(report.hooks, null);
   assert.match(report.tunnelPlist, /<key>KeepAlive<\/key><true\/>/);
   assert.match(report.tunnelPlist, /<key>RunAtLoad<\/key><true\/>/);
   assert.match(report.tunnelPlist, /--url/);
@@ -348,6 +352,31 @@ test("install dry-run uses PATH cloudflared and the stable node", async () => {
   assert.match(preview.stdout, new RegExp(node.replaceAll("/", "\\/")));
   assert.equal(preview.stdout.includes("Cellar"), false);
   await assert.rejects(() => stat(tokenPath(home)));
+});
+
+test("install merges the hooks into settings.json with a backup, and uninstall takes them out", async () => {
+  const { home } = await tempHome();
+  const launchAgents = path.join(home, "Library", "LaunchAgents");
+  await mkdir(launchAgents, { recursive: true });
+  await chmod(launchAgents, 0o755);
+  const configRoot = path.join(home, "claude-config");
+  await mkdir(configRoot, { recursive: true });
+  await writeFile(path.join(configRoot, "settings.json"), JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "keep-me" }] }] } }));
+  const report = await executeInstall(input(home, { allowApprove: true, approveTimeoutS: 90, configRoot, now: new Date("2026-10-18T09:00:00Z") }), recorder().hooks);
+  assert.match(report.httpPlist, /CLAUDE_REMOTE_ALLOW_APPROVE<\/key><string>1<\/string>/);
+  assert.match(report.httpPlist, /CLAUDE_REMOTE_APPROVE_TIMEOUT_S<\/key><string>90<\/string>/);
+  assert.equal(report.hooks?.changed, true);
+  assert.equal(report.hooks?.backupPath, path.join(configRoot, "settings.json.bak-claude-remote-20261018T090000Z"));
+  const merged = JSON.parse(await readFile(path.join(configRoot, "settings.json"), "utf8"));
+  assert.equal(merged.model, "opus");
+  assert.equal(merged.hooks.Stop.length, 2);
+  assert.equal(merged.hooks.PermissionRequest[0].hooks[0].timeout, 105);
+  const skipped = await executeInstall(input(home, { configRoot, hooks: false }), recorder().hooks);
+  assert.equal(skipped.hooks, null);
+  assert.deepEqual(skipped.hookEvents, []);
+  const removed = await executeUninstall({ home, uid: 501, dryRun: false, purge: false, launchctlBin: "/fake/launchctl", claudeBin: "/fake/claude", configRoot, now: new Date("2026-10-18T09:30:00Z") }, recorder().hooks);
+  assert.ok(removed.hooks && "changed" in removed.hooks && removed.hooks.changed);
+  assert.deepEqual(JSON.parse(await readFile(path.join(configRoot, "settings.json"), "utf8")), { model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "keep-me" }] }] } });
 });
 
 test("install pins the claude CLI it found on PATH", async () => {

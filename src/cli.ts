@@ -1,4 +1,4 @@
-import { parseConfig, type Config } from "./config.js";
+import { approveTimeoutSeconds, MAX_APPROVE_TIMEOUT_S, parseConfig, type Config } from "./config.js";
 import { cleanupDesk } from "./cleanup.js";
 import { DeskError, assertNever } from "./domain.js";
 import { listenHttp, resolveHttpPort, HTTP_HOST } from "./http.js";
@@ -26,7 +26,7 @@ const COMMANDS = ["list", "show", "new", "continue", "send", "rename", "stop", "
 
 type CommandName = (typeof COMMANDS)[number];
 
-const USAGE = "usage: claude-remote list|show|new|continue|send|rename|stop|cleanup|http|install|uninstall|status|rotate-token";
+const USAGE = "usage: claude-remote list|show|new|continue|send|rename|stop|cleanup|http|install|uninstall|status|rotate-token|hook";
 
 type Parsed =
   | { command: "list"; json: boolean; project?: string }
@@ -38,7 +38,7 @@ type Parsed =
   | { command: "stop"; json: boolean; sessionId?: string; target?: string }
   | { command: "cleanup"; json: boolean }
   | { command: "http"; port?: number }
-  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; port?: number }
+  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; approveTimeoutS?: number; hooks: boolean; port?: number }
   | { command: "uninstall"; json: boolean; dryRun: boolean; purge: boolean }
   | { command: "status"; json: boolean }
   | { command: "rotate-token"; json: boolean };
@@ -148,6 +148,10 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         port,
         allowSend: parsed.allowSend,
         allowLaunch: parsed.allowLaunch,
+        allowApprove: parsed.allowApprove,
+        approveTimeoutS: parsed.approveTimeoutS ?? approveTimeoutSeconds(env.CLAUDE_REMOTE_APPROVE_TIMEOUT_S),
+        hooks: parsed.hooks,
+        configRoot: config.configRoot,
         dryRun: parsed.dryRun,
         nodeBin,
         entry: serverEntry(),
@@ -169,6 +173,7 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         purge: parsed.purge,
         launchctlBin: env.CLAUDE_REMOTE_LAUNCHCTL_BIN || "launchctl",
         claudeBin: config.claudeBin,
+        configRoot: config.configRoot,
       });
       io.stdout(parsed.json ? `${JSON.stringify(report)}\n` : uninstallText(report));
       return 0;
@@ -366,6 +371,9 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
   let dryRun = false;
   let allowSend = false;
   let allowLaunch = false;
+  let allowApprove = false;
+  let approveTimeoutS: number | undefined;
+  let hooks = true;
   let purge = false;
   let port: number | undefined;
   for (const token of argv) {
@@ -373,6 +381,9 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     else if (token === "--dry-run") dryRun = true;
     else if (token === "--allow-send") allowSend = true;
     else if (token === "--allow-launch") allowLaunch = true;
+    else if (token === "--allow-approve" && command === "install") allowApprove = true;
+    else if (token === "--no-hooks" && command === "install") hooks = false;
+    else if (token.startsWith("--approve-timeout=") && command === "install") approveTimeoutS = parseApproveTimeout(token.slice("--approve-timeout=".length));
     else if (token === "--purge") purge = true;
     else if (token.startsWith("--port=")) port = parsePort(token.slice("--port=".length));
     else throw new DeskError("usage", USAGE);
@@ -383,7 +394,7 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
       return { command, port };
     case "install":
       if (purge) throw new DeskError("usage", USAGE);
-      return { command, json, dryRun, allowSend, allowLaunch, port };
+      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, approveTimeoutS, hooks, port };
     case "uninstall":
       if (allowSend || allowLaunch || port != null) throw new DeskError("usage", USAGE);
       return { command, json, dryRun, purge };
@@ -398,6 +409,12 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
       return assertNever(_never);
     }
   }
+}
+
+function parseApproveTimeout(raw: string): number {
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 5 || parsed > MAX_APPROVE_TIMEOUT_S) throw new DeskError("usage", USAGE);
+  return parsed;
 }
 
 function parsePort(raw: string): number {
@@ -421,6 +438,10 @@ function installText(report: InstallReport): string {
     `url=${report.url ?? "-"}`,
     `port=${report.port}`,
     `brew=${report.brew}`,
+    `hookEvents=${report.hookEvents.join(",") || "-"}`,
+    `settings=${report.hooks ? report.hooks.settingsPath : "-"}`,
+    `settingsChanged=${report.hooks ? (report.hooks.changed ? "yes" : "no") : "-"}`,
+    `settingsBackup=${report.hooks?.backupPath ?? "-"}`,
     report.httpPlist,
     report.tunnelPlist,
   ].join("\n") + "\n";
@@ -438,7 +459,10 @@ function statusText(report: StatusReport): string {
 }
 
 function uninstallText(report: UninstallReport): string {
-  return `dryRun=${report.dryRun ? "yes" : "no"}\npurge=${report.purge ? "yes" : "no"}\nremoved=${report.removed.join(",")}\n`;
+  const hooks = report.hooks && "changed" in report.hooks
+    ? `settingsChanged=${report.hooks.changed ? "yes" : "no"}\nsettingsBackup=${report.hooks.backupPath ?? "-"}\n`
+    : report.hooks ? `hooksInstalled=${report.hooks.installed ? "yes" : "no"}\n` : "";
+  return `dryRun=${report.dryRun ? "yes" : "no"}\npurge=${report.purge ? "yes" : "no"}\nremoved=${report.removed.join(",")}\n${hooks}`;
 }
 
 function listLine(row: DeskRow): string {

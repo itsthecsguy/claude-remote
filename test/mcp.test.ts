@@ -18,7 +18,7 @@ test("tools/list hides send until the flag is set, and confirm false does not sp
     const info = (init.result as { serverInfo?: { name?: string } } | undefined)?.serverInfo;
     assert.equal(info?.name, "claude-remote");
     const listed = await off.request("tools/list", {}, 2);
-    assert.deepEqual(toolNames(listed), ["list_sessions", "get_session", "continue_command", "rename_session", "cleanup_desk"]);
+    assert.deepEqual(toolNames(listed), ["list_sessions", "get_session", "continue_command", "rename_session", "cleanup_desk", "list_pending"]);
   } finally {
     off.close();
   }
@@ -56,7 +56,7 @@ test("tools/list hides send until the flag is set, and confirm false does not sp
   try {
     await initialize(on);
     const listed = await on.request("tools/list", {}, 2);
-    assert.deepEqual(toolNames(listed), ["list_sessions", "get_session", "continue_command", "rename_session", "cleanup_desk", "send_followup", "queue_status"]);
+    assert.deepEqual(toolNames(listed), ["list_sessions", "get_session", "continue_command", "rename_session", "cleanup_desk", "send_followup", "queue_status", "list_pending"]);
     const denied = await on.request("tools/call", {
       name: "send_followup",
       arguments: { sessionId: id, message: "hello", confirm: false },
@@ -89,6 +89,7 @@ test("tools/list hides send until the flag is set, and confirm false does not sp
       "new_session",
       "continue_session",
       "stop_session",
+      "list_pending",
     ]);
   } finally {
     launch.close();

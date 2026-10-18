@@ -8,6 +8,8 @@ import { DeskError, assertNever } from "./domain.js";
 import { HTTP_HOST, HTTP_PORT } from "./http.js";
 import { assertSpawnAllowed } from "./launch.js";
 import { ensureToken, tokenDirectory, tokenPath } from "./token.js";
+import { DEFAULT_APPROVE_TIMEOUT_S } from "./config.js";
+import { hookPlan, hooksInstalled, installHooks, settingsPathFor, uninstallHooks, type HookPlan, type SettingsEdit } from "./hook-settings.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -40,6 +42,11 @@ export type InstallInput = {
   launchctlBin: string;
   claudeBin: string;
   urlWaitMs: number;
+  allowApprove?: boolean;
+  approveTimeoutS?: number;
+  hooks?: boolean;
+  configRoot?: string;
+  now?: Date;
 };
 
 export type InstallHooks = {
@@ -59,6 +66,8 @@ export type InstallReport = {
   tunnelPlistPath: string;
   httpPlist: string;
   tunnelPlist: string;
+  hookEvents: string[];
+  hooks: SettingsEdit | null;
 };
 
 export type StatusReport = {
@@ -74,6 +83,7 @@ export type UninstallReport = {
   dryRun: boolean;
   purge: boolean;
   removed: string[];
+  hooks: SettingsEdit | { settingsPath: string; installed: boolean } | null;
 };
 
 export function packageRoot(): string {
@@ -138,11 +148,17 @@ export function renderHttpPlist(input: InstallInput): string {
     CLAUDE_REMOTE_ALLOW_SEND: input.allowSend ? "1" : "0",
     CLAUDE_REMOTE_ALLOW_LAUNCH: input.allowLaunch ? "1" : "0",
     CLAUDE_REMOTE_HTTP_PORT: String(input.port),
+    CLAUDE_REMOTE_ALLOW_APPROVE: input.allowApprove ? "1" : "0",
+    CLAUDE_REMOTE_APPROVE_TIMEOUT_S: String(input.approveTimeoutS ?? DEFAULT_APPROVE_TIMEOUT_S),
     ...(path.isAbsolute(input.claudeBin) ? { CLAUDE_REMOTE_CLAUDE_BIN: input.claudeBin } : {}),
   }, {
     out: helperLogPath(input.home),
     err: helperLogPath(input.home),
   });
+}
+
+function planFor(input: InstallInput): HookPlan {
+  return hookPlan(input.nodeBin, input.entry, input.approveTimeoutS ?? DEFAULT_APPROVE_TIMEOUT_S);
 }
 
 export function renderTunnelPlist(input: InstallInput): string {
@@ -169,6 +185,8 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
     tunnelPlistPath: tunnelPlistPath(input.home),
     httpPlist: renderHttpPlist(input),
     tunnelPlist: renderTunnelPlist(input),
+    hookEvents: input.hooks === false ? [] : Object.keys(planFor(input)),
+    hooks: null,
   };
   if (input.dryRun) return report;
   await hooks.build();
@@ -190,6 +208,9 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
   const tunnelBoot = await hooks.run(input.launchctlBin, ["bootstrap", domain, report.tunnelPlistPath]);
   if (tunnelBoot.code !== 0) throw new DeskError("launchctl-failed", "tunnel did not load");
   await registerChannel(input, hooks);
+  if (input.hooks !== false) {
+    report.hooks = await installHooks(input.configRoot ?? path.join(input.home, ".claude"), planFor(input), input.now);
+  }
   report.url = await waitForUrl(input.home, input.urlWaitMs);
   return report;
 }
@@ -214,9 +235,10 @@ export async function executeStatus(
 }
 
 export async function executeUninstall(
-  input: { home: string; uid: number; dryRun: boolean; purge: boolean; launchctlBin: string; claudeBin: string },
+  input: { home: string; uid: number; dryRun: boolean; purge: boolean; launchctlBin: string; claudeBin: string; configRoot?: string; now?: Date },
   hooks: InstallHooks = defaultHooks(),
 ): Promise<UninstallReport> {
+  const configRoot = input.configRoot ?? path.join(input.home, ".claude");
   const removed = [
     httpPlistPath(input.home),
     tunnelPlistPath(input.home),
@@ -224,18 +246,21 @@ export async function executeUninstall(
     portPath(input.home),
     tunnelLogPath(input.home),
   ];
-  if (input.dryRun) return { dryRun: true, purge: input.purge, removed };
+  if (input.dryRun) {
+    return { dryRun: true, purge: input.purge, removed, hooks: { settingsPath: settingsPathFor(configRoot), installed: await hooksInstalled(configRoot) } };
+  }
   const domain = `gui/${input.uid}`;
   await hooks.run(input.launchctlBin, ["bootout", `${domain}/${HTTP_LABEL}`]);
   await hooks.run(input.launchctlBin, ["bootout", `${domain}/${TUNNEL_LABEL}`]);
   for (const file of removed) await unlinkFile(file);
   await hooks.run(input.claudeBin, ["mcp", "remove", "--scope", "user", "claude-remote-channel"]);
+  const settings = await uninstallHooks(configRoot, input.now);
   if (input.purge) {
     for (const name of ["attachments", "queue", "inbox", "launches", "c", "channel", "mcp", "http", "tunnel"]) {
       await rmTreeSafe(path.join(input.home, ".claude-remote", name));
     }
   }
-  return { dryRun: false, purge: input.purge, removed };
+  return { dryRun: false, purge: input.purge, removed, hooks: settings };
 }
 
 export function defaultHooks(): InstallHooks {

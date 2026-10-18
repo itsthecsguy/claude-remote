@@ -19,7 +19,19 @@ export type Config = {
   osascriptBin: string;
   agentsJson: boolean;
   allowDeliver: boolean;
+  allowApprove: boolean;
+  approveTimeoutMs: number;
 };
+
+export const DEFAULT_APPROVE_TIMEOUT_S = 120;
+export const MAX_APPROVE_TIMEOUT_S = 600;
+
+export function approveTimeoutSeconds(raw: string | undefined): number {
+  if (!raw) return DEFAULT_APPROVE_TIMEOUT_S;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 5 || parsed > MAX_APPROVE_TIMEOUT_S) return DEFAULT_APPROVE_TIMEOUT_S;
+  return parsed;
+}
 
 const PLATFORMS = new Set<NodeJS.Platform>([
   "aix",
@@ -84,6 +96,8 @@ export function parseConfig(
       : "osascript",
     agentsJson: env.CLAUDE_REMOTE_AGENTS_JSON !== "0",
     allowDeliver: env.CLAUDE_REMOTE_ALLOW_DELIVER === "1",
+    allowApprove: env.CLAUDE_REMOTE_ALLOW_APPROVE === "1",
+    approveTimeoutMs: approveTimeoutSeconds(env.CLAUDE_REMOTE_APPROVE_TIMEOUT_S) * 1000,
   };
 }
 

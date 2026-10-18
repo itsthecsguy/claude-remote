@@ -15,12 +15,18 @@ import { DeskError } from "./domain.js";
 import { registerDeliverTool } from "./deliver.js";
 import { registerLaunchTools } from "./launch.js";
 import { logEvent } from "./log.js";
+import { pendingStore, registerPendingTools } from "./pending.js";
 import { bearerMatches, readToken } from "./token.js";
 import { registerTools } from "./tools.js";
 
 export const HTTP_HOST = "127.0.0.1";
 export const HTTP_PORT = 47321;
 export const MCP_PATH = "/mcp";
+export const HOOK_EVENT_PATH = "/hook/event";
+export const HOOK_WAIT_PATH = "/hook/wait";
+const HOOK_PATHS = new Set([HOOK_EVENT_PATH, HOOK_WAIT_PATH]);
+const MAX_HOOK_BODY = 1024 * 1024;
+const FORWARDED_HEADERS = ["cf-connecting-ip", "cf-ray", "x-forwarded-for", "forwarded", "cdn-loop"];
 
 const MAX_BODY = 4 * 1024 * 1024;
 
@@ -91,7 +97,7 @@ async function onRequest(
   const hostHeader = oneHeader(req.headers.host);
   const originHeader = oneHeader(req.headers.origin);
   const url = new URL(req.url ?? "/", `http://${HTTP_HOST}`);
-  if (url.pathname !== MCP_PATH) {
+  if (url.pathname !== MCP_PATH && !HOOK_PATHS.has(url.pathname)) {
     res.writeHead(404);
     res.end();
     return;
@@ -116,6 +122,10 @@ async function onRequest(
     return;
   }
   const method = req.method ?? "GET";
+  if (HOOK_PATHS.has(url.pathname)) {
+    await onHookRequest(config, url.pathname, method, req, res, body);
+    return;
+  }
   if (method === "POST" && !isJsonContentType(oneHeader(req.headers["content-type"]))) {
     res.writeHead(415);
     res.end();
@@ -150,12 +160,65 @@ async function onRequest(
   }
 }
 
+/**
+ * Endpoints for `claude-remote hook`. They take the same bearer token, and they refuse any request
+ * that came through a tunnel (Cloudflare adds forwarding headers), so only a hook process on this
+ * machine can register events or wait for answers. Bodies are never logged.
+ */
+async function onHookRequest(
+  config: Config,
+  pathname: string,
+  method: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+  body: Buffer,
+): Promise<void> {
+  if (FORWARDED_HEADERS.some((name) => req.headers[name] !== undefined)) {
+    logEvent({ tool: "hook", code: "forwarded-rejected" });
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+  if (method !== "POST" || !isJsonContentType(oneHeader(req.headers["content-type"]))) {
+    res.writeHead(415);
+    res.end();
+    return;
+  }
+  if (body.length > MAX_HOOK_BODY) {
+    res.writeHead(413);
+    res.end();
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    json(res, 400, { error: "bad-json" });
+    return;
+  }
+  if (pathname === HOOK_EVENT_PATH) {
+    const result = pendingStore.record(parsed, { allowApprove: config.allowApprove, waitMs: config.approveTimeoutMs });
+    const name = parsed && typeof parsed === "object" ? (parsed as { hook_event_name?: unknown }).hook_event_name : null;
+    logEvent({ tool: "hook", evidence: typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? name : "unknown", code: result.wait ? "wait" : "recorded" });
+    json(res, 200, result);
+    return;
+  }
+  const request = parsed && typeof parsed === "object" ? parsed as { requestId?: unknown; sliceMs?: unknown } : {};
+  const requestId = typeof request.requestId === "string" ? request.requestId : "";
+  const sliceMs = typeof request.sliceMs === "number" && Number.isFinite(request.sliceMs) ? request.sliceMs : 0;
+  const abort = new AbortController();
+  res.on("close", () => abort.abort());
+  const result = await pendingStore.wait(requestId, sliceMs, abort.signal);
+  if (res.writableEnded || res.destroyed) return;
+  json(res, 200, result);
+}
+
 function deskFactory(config: Config): () => McpServer {
   return () => {
     const server = new McpServer({ name: "claude-remote", version: "0.1.0" });
     registerTools(server, config);
     registerLaunchTools(server, config);
     registerDeliverTool(server, config);
+    registerPendingTools(server, config);
     return server;
   };
 }
