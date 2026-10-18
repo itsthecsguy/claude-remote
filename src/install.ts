@@ -47,6 +47,7 @@ export type InstallInput = {
   hooks?: boolean;
   configRoot?: string;
   now?: Date;
+  bootstrapRetryMs?: number;
 };
 
 export type InstallHooks = {
@@ -210,11 +211,11 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
   report.tunnelReloaded = !(tunnelLoaded && previousTunnel === report.tunnelPlist);
   await hooks.run(input.launchctlBin, ["bootout", `${domain}/${HTTP_LABEL}`]);
   if (report.tunnelReloaded) await hooks.run(input.launchctlBin, ["bootout", `${domain}/${TUNNEL_LABEL}`]);
-  const httpBoot = await hooks.run(input.launchctlBin, ["bootstrap", domain, report.httpPlistPath]);
-  if (httpBoot.code !== 0) throw new DeskError("launchctl-failed", "http helper did not load");
+  const httpBoot = await bootstrapWithRetry(hooks, input.launchctlBin, domain, report.httpPlistPath, input.bootstrapRetryMs);
+  if (httpBoot !== 0) throw new DeskError("launchctl-failed", "http helper did not load");
   if (report.tunnelReloaded) {
-    const tunnelBoot = await hooks.run(input.launchctlBin, ["bootstrap", domain, report.tunnelPlistPath]);
-    if (tunnelBoot.code !== 0) throw new DeskError("launchctl-failed", "tunnel did not load");
+    const tunnelBoot = await bootstrapWithRetry(hooks, input.launchctlBin, domain, report.tunnelPlistPath, input.bootstrapRetryMs);
+    if (tunnelBoot !== 0) throw new DeskError("launchctl-failed", "tunnel did not load");
   }
   await registerChannel(input, hooks);
   if (input.hooks !== false) {
@@ -363,6 +364,24 @@ export async function ensureLog(file: string): Promise<void> {
   }
   await handle.close();
   await chmod(file, 0o600);
+}
+
+// launchctl bootout returns before launchd has finished removing a running job, and a bootstrap
+// of the same label fails until it has (EIO). Retry for a few seconds.
+async function bootstrapWithRetry(
+  hooks: InstallHooks,
+  launchctlBin: string,
+  domain: string,
+  plistPath: string,
+  delayMs = 500,
+): Promise<number> {
+  let code = 1;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    code = (await hooks.run(launchctlBin, ["bootstrap", domain, plistPath])).code ?? 1;
+    if (code === 0) return 0;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return code;
 }
 
 async function readPlainFile(file: string): Promise<string | null> {

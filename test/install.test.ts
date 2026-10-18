@@ -385,6 +385,30 @@ test("install merges the hooks into settings.json with a backup, and uninstall t
   assert.deepEqual(JSON.parse(await readFile(path.join(configRoot, "settings.json"), "utf8")), { model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "keep-me" }] }] } });
 });
 
+test("install retries a bootstrap that races the bootout of a running helper", async () => {
+  const { home } = await tempHome();
+  const launchAgents = path.join(home, "Library", "LaunchAgents");
+  await mkdir(launchAgents, { recursive: true });
+  await chmod(launchAgents, 0o755);
+  const recorded = recorder();
+  let refusals = 2;
+  const racing: InstallHooks = {
+    build: recorded.hooks.build,
+    run: async (bin, args) => {
+      if (args[0] === "bootstrap" && args[2]?.endsWith("com.claude-remote.http.plist") && refusals > 0) {
+        refusals -= 1;
+        recorded.calls.push(`${bin} ${args.join(" ")} (EIO)`);
+        return { code: 5, stdout: "", stderr: "" };
+      }
+      return recorded.hooks.run(bin, args);
+    },
+  };
+  await executeInstall(input(home, { configRoot: path.join(home, "cfg"), bootstrapRetryMs: 1 }), racing);
+  assert.equal(recorded.calls.filter((line) => line.includes("bootstrap") && line.includes("com.claude-remote.http.plist")).length, 3);
+  refusals = 100;
+  await assert.rejects(() => executeInstall(input(home, { configRoot: path.join(home, "cfg"), bootstrapRetryMs: 1 }), racing), /http helper did not load/);
+});
+
 test("install pins the claude CLI it found on PATH", async () => {
   const { home } = await tempHome();
   const bin = path.join(home, "bin");
