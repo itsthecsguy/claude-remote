@@ -9,6 +9,7 @@ import { HTTP_HOST, HTTP_PORT } from "./http.js";
 import { assertSpawnAllowed } from "./launch.js";
 import { ensureToken, tokenDirectory, tokenPath } from "./token.js";
 import { DEFAULT_APPROVE_TIMEOUT_S } from "./config.js";
+import { checkNotifyUrl, describeNotifyUrl, notifyFilePath, secretUsable, type NotifyFile } from "./notify.js";
 import { hookPlan, hooksInstalled, installHooks, settingsPathFor, uninstallHooks, type HookPlan, type SettingsEdit } from "./hook-settings.js";
 
 const execFileAsync = promisify(execFile);
@@ -48,6 +49,7 @@ export type InstallInput = {
   configRoot?: string;
   now?: Date;
   bootstrapRetryMs?: number;
+  notify?: NotifyFile | null;
 };
 
 export type InstallHooks = {
@@ -70,6 +72,7 @@ export type InstallReport = {
   hookEvents: string[];
   hooks: SettingsEdit | null;
   tunnelReloaded: boolean;
+  notify: { url: string; signed: boolean; auth: string; includeText: boolean; cleared: boolean } | null;
 };
 
 export type StatusReport = {
@@ -159,6 +162,13 @@ export function renderHttpPlist(input: InstallInput): string {
   });
 }
 
+function checkNotifyInput(notify: NotifyFile | null | undefined): notify is NotifyFile {
+  if (!notify) return false;
+  if (!checkNotifyUrl(notify.url)) throw new DeskError("usage", "--notify-url must be https, or http on 127.0.0.1 or localhost, with no user name or password");
+  if (notify.secret !== undefined && !secretUsable(notify.secret)) throw new DeskError("usage", "--notify-secret must be 16 to 512 characters with no spaces or quotes");
+  return true;
+}
+
 function planFor(input: InstallInput): HookPlan {
   return hookPlan(input.nodeBin, input.entry, input.approveTimeoutS ?? DEFAULT_APPROVE_TIMEOUT_S);
 }
@@ -190,6 +200,13 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
     hookEvents: input.hooks === false ? [] : Object.keys(planFor(input)),
     hooks: null,
     tunnelReloaded: false,
+    notify: checkNotifyInput(input.notify) ? {
+      url: describeNotifyUrl(input.notify.url),
+      signed: Boolean(input.notify.secret),
+      auth: input.notify.auth ?? "hmac",
+      includeText: input.notify.includeText === true,
+      cleared: input.notify.cleared === true,
+    } : null,
   };
   if (input.dryRun) return report;
   await hooks.build();
@@ -199,6 +216,9 @@ export async function executeInstall(input: InstallInput, hooks: InstallHooks = 
   }
   await ensureToken(input.home);
   await writePrivate(portPath(input.home), `${input.port}\n`);
+  // The helper reads the alert endpoint and secret from this file, so neither goes in the plist.
+  if (input.notify) await writePrivate(notifyFilePath(input.home), `${JSON.stringify(input.notify)}\n`);
+  else await unlinkFile(notifyFilePath(input.home));
   await ensureLog(helperLogPath(input.home));
   await ensureLog(tunnelLogPath(input.home));
   await writePrivate(report.httpPlistPath, report.httpPlist, "launchAgents");
@@ -255,6 +275,7 @@ export async function executeUninstall(
     tokenPath(input.home),
     portPath(input.home),
     tunnelLogPath(input.home),
+    notifyFilePath(input.home),
   ];
   if (input.dryRun) {
     return { dryRun: true, purge: input.purge, removed, hooks: { settingsPath: settingsPathFor(configRoot), installed: await hooksInstalled(configRoot) } };

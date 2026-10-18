@@ -30,6 +30,7 @@ export type PendingView = {
   requestId: string;
   sessionId: string;
   agentId: string | null;
+  projectName: string | null;
   kind: PendingKind;
   createdAt: string;
   expiresAt: string | null;
@@ -98,6 +99,7 @@ export class PendingStore {
     const name = typeof event.hook_event_name === "string" ? event.hook_event_name : "";
     if (!sessionId) return none;
     const agentId = safeId(event.agent_id);
+    const projectName = projectNameOf(event.cwd);
     const now = this.clock();
     this.sweep(now);
     if (CLEAR_ALL_EVENTS.has(name)) {
@@ -121,6 +123,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "notification",
         toolName: null,
         notificationType: typeof event.notification_type === "string" ? clip(event.notification_type, 64) : null,
@@ -137,6 +140,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "permission",
         toolName,
         notificationType: null,
@@ -155,6 +159,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "question",
         toolName,
         notificationType: null,
@@ -336,6 +341,12 @@ export const pendingStore = new PendingStore();
 function safeId(value: unknown): string | null {
   if (typeof value !== "string" || !ID_RE.test(value)) return null;
   return value.toLowerCase();
+}
+
+function projectNameOf(cwd: unknown): string | null {
+  if (typeof cwd !== "string" || cwd.length === 0 || cwd.length > 4096) return null;
+  const name = cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+  return name.length > 0 ? clip(name, 200) : null;
 }
 
 function clip(value: string, max: number): string {

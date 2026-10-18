@@ -15,6 +15,7 @@ import { DeskError } from "./domain.js";
 import { registerDeliverTool } from "./deliver.js";
 import { registerLaunchTools } from "./launch.js";
 import { logEvent } from "./log.js";
+import { loadNotifySettings, startNotifier } from "./notify.js";
 import { pendingStore, registerPendingTools } from "./pending.js";
 import { bearerMatches, readToken } from "./token.js";
 import { registerTools } from "./tools.js";
@@ -35,7 +36,7 @@ export type HttpListener = {
   close: () => Promise<void>;
 };
 
-export async function listenHttp(config: Config, port = HTTP_PORT): Promise<HttpListener> {
+export async function listenHttp(config: Config, port = HTTP_PORT, options: { env?: NodeJS.ProcessEnv } = {}): Promise<HttpListener> {
   if (port < 0 || port > 65535) throw new DeskError("usage", "port is not allowed");
   const modern = createMcpHandler(deskFactory(config), {
     legacy: "reject",
@@ -56,9 +57,12 @@ export async function listenHttp(config: Config, port = HTTP_PORT): Promise<Http
     server.close();
     throw new DeskError("denied", "http listener must bind to 127.0.0.1");
   }
+  const notify = await loadNotifySettings(options.env ?? process.env, config.home);
+  const alerts = notify ? startNotifier(pendingStore, notify) : null;
   return {
     port: address.port,
     close: () => new Promise((resolve, reject) => {
+      alerts?.stop();
       server.closeAllConnections();
       server.close((error) => error ? reject(error) : resolve());
     }),
