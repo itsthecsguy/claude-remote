@@ -8,7 +8,8 @@ import { logEvent } from "./log.js";
 /**
  * Pending attention reported by Claude Code hooks (see `claude-remote hook`).
  *
- * Entries live in this process's memory only. They are never written to disk or to the log,
+ * Entries live in this process's memory. The HTTP helper also saves them to a 0600 file in the
+ * state dir (see pending-file.ts) so a restart keeps them. They are never written to the log,
  * because they carry question, notification and tool-input text. Authenticated MCP clients can
  * read them through list_sessions, get_session and list_pending.
  *
@@ -63,6 +64,13 @@ type Entry = {
   waiters: Set<(result: WaitResult) => void>;
   lastSeenMs: number;
   delivered: boolean;
+};
+
+/** One entry as saved to disk. Waiters, decisions and answerability are not saved. */
+export type SavedEntry = {
+  view: PendingView;
+  createdMs: number;
+  matchKey: string | null;
 };
 
 const MAX_ENTRIES = 500;
@@ -232,6 +240,41 @@ export class PendingStore {
     }
     out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return out;
+  }
+
+  /** Entries in a form that can be saved, oldest first. */
+  snapshot(): SavedEntry[] {
+    return [...this.entries.values()].map((entry) => ({ view: { ...entry.view }, createdMs: entry.createdMs, matchKey: entry.matchKey }));
+  }
+
+  /**
+   * Put saved entries back after a restart. A restored entry is never answerable: the hook that
+   * was waiting for it gave up when the helper went away, and the prompt fell back to the app or
+   * terminal. Restoring does not notify observers. Returns how many entries were restored.
+   */
+  restore(saved: readonly SavedEntry[]): number {
+    let count = 0;
+    for (const item of saved) {
+      const view = item.view;
+      if (this.entries.has(view.requestId) || !REQUEST_RE.test(view.requestId)) continue;
+      this.entries.set(view.requestId, {
+        view: { ...view, answerable: false, expiresAt: null },
+        createdMs: item.createdMs,
+        deadlineMs: null,
+        matchKey: item.matchKey,
+        decision: null,
+        waiters: new Set(),
+        lastSeenMs: item.createdMs,
+        delivered: false,
+      });
+      count += 1;
+    }
+    while (this.entries.size > MAX_ENTRIES) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
+    }
+    return count;
   }
 
   /** Drop entries a status change shows are over. */
@@ -442,7 +485,7 @@ export function attachPending<T extends { sessionId: string; status: { value: st
   return { ...card, pending: store.list({ sessionId: card.sessionId }).slice(0, 10) };
 }
 
-const LIST_PENDING_DESCRIPTION = "List what live sessions are waiting on, as reported by the claude-remote Claude Code hooks: permission requests (tool name and a summary of the tool input), AskUserQuestion questions (question text and options), and notifications (message text and notification_type, such as idle_prompt or permission_prompt). Entries are kept in the helper's memory only and are cleared when the session moves on (the next prompt, tool result, or stop) or stops running. answerable is true while a hook is still waiting for a remote answer; answer it with answer_permission or answer_question when those tools are enabled, otherwise answer in the app or terminal. Empty when the hooks are not installed.";
+const LIST_PENDING_DESCRIPTION = "List what live sessions are waiting on, as reported by the claude-remote Claude Code hooks: permission requests (tool name and a summary of the tool input), AskUserQuestion questions (question text and options), and notifications (message text and notification_type, such as idle_prompt or permission_prompt). Entries are kept in the helper's memory and in a private file in its state dir, so they survive a helper restart (restored entries are never answerable), and are cleared when the session moves on (the next prompt, tool result, or stop) or stops running. answerable is true while a hook is still waiting for a remote answer; answer it with answer_permission or answer_question when those tools are enabled, otherwise answer in the app or terminal. Empty when the hooks are not installed.";
 
 const ANSWER_PERMISSION_DESCRIPTION = "Answer one pending permission request from list_pending. Requires CLAUDE_REMOTE_ALLOW_APPROVE=1 and confirm set to true. decision is allow or deny for this single request only: it never adds a permission rule, never changes the permission mode, and never edits the tool input. Deny and ask rules in the session's settings still apply after an allow. message is passed to Claude with a deny. Fails when no hook is waiting any more (the request timed out to the normal prompt, or was answered locally). The message is not logged.";
 

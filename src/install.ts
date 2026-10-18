@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { DeskError, assertNever } from "./domain.js";
 import { HTTP_HOST, HTTP_PORT } from "./http.js";
 import { assertSpawnAllowed } from "./launch.js";
+import { pendingFilePath } from "./pending-file.js";
 import { ensureToken, tokenDirectory, tokenPath } from "./token.js";
 import { DEFAULT_APPROVE_TIMEOUT_S } from "./config.js";
 import { hookPlan, hooksInstalled, installHooks, settingsPathFor, uninstallHooks, type HookPlan, type SettingsEdit } from "./hook-settings.js";
@@ -252,6 +253,7 @@ export async function executeUninstall(
   const removed = [
     httpPlistPath(input.home),
     tunnelPlistPath(input.home),
+    pendingFilePath(input.home),
     tokenPath(input.home),
     portPath(input.home),
     tunnelLogPath(input.home),
