@@ -9,6 +9,7 @@ import {
   executeUninstall,
   resolveCloudflared,
   serverEntry,
+  resolveClaudeBin,
   stableNodeBin,
   type InstallReport,
   type StatusReport,
@@ -154,7 +155,7 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         cloudflaredPresent: cloudflared.present,
         brewBin: env.CLAUDE_REMOTE_BREW_BIN || "brew",
         launchctlBin: env.CLAUDE_REMOTE_LAUNCHCTL_BIN || "launchctl",
-        claudeBin: config.claudeBin,
+        claudeBin: await resolveClaudeBin(config.claudeBin, env.PATH),
         urlWaitMs: urlWaitMs(env),
       });
       io.stdout(parsed.json ? `${JSON.stringify(report)}\n` : installText(report));

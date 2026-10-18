@@ -37,7 +37,7 @@ node dist/index.js rotate-token
 node dist/index.js http
 ```
 
-`--dry-run` prints the plists and writes nothing. Running `install` again keeps the existing token and rewrites the plists. `--allow-send` and `--allow-launch` default to off in the LaunchAgent. Passing them sets `CLAUDE_REMOTE_ALLOW_SEND` and `CLAUDE_REMOTE_ALLOW_LAUNCH` to `1` for the helper only. A foreground `node dist/index.js http` uses the environment of that process instead.
+`install` resolves `claude` (or `CLAUDE_REMOTE_CLAUDE_BIN`) against the installing shell's `PATH` and writes the absolute path into the helper plist as `CLAUDE_REMOTE_CLAUDE_BIN`, because launchd starts the helper with a fixed `PATH` that usually lacks `~/.local/bin`. `--dry-run` prints the plists and writes nothing. Running `install` again keeps the existing token and rewrites the plists. `--allow-send` and `--allow-launch` default to off in the LaunchAgent. Passing them sets `CLAUDE_REMOTE_ALLOW_SEND` and `CLAUDE_REMOTE_ALLOW_LAUNCH` to `1` for the helper only. A foreground `node dist/index.js http` uses the environment of that process instead.
 
 The labels are `com.claude-remote.http` and `com.claude-remote.tunnel`. The plists are `~/Library/LaunchAgents/com.claude-remote.http.plist` and `~/Library/LaunchAgents/com.claude-remote.tunnel.plist`, mode `0600`, with `RunAtLoad` and `KeepAlive`.
 

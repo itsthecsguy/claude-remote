@@ -138,6 +138,7 @@ export function renderHttpPlist(input: InstallInput): string {
     CLAUDE_REMOTE_ALLOW_SEND: input.allowSend ? "1" : "0",
     CLAUDE_REMOTE_ALLOW_LAUNCH: input.allowLaunch ? "1" : "0",
     CLAUDE_REMOTE_HTTP_PORT: String(input.port),
+    ...(path.isAbsolute(input.claudeBin) ? { CLAUDE_REMOTE_CLAUDE_BIN: input.claudeBin } : {}),
   }, {
     out: helperLogPath(input.home),
     err: helperLogPath(input.home),
@@ -239,6 +240,17 @@ export async function executeUninstall(
 
 export function defaultHooks(): InstallHooks {
   return { run: defaultRun, build: defaultBuild };
+}
+
+// launchd starts the helper with a fixed PATH, so pin the CLI the installer found.
+export async function resolveClaudeBin(bin: string, searchPath: string | undefined): Promise<string> {
+  if (bin.includes("/")) return path.resolve(bin);
+  for (const dir of (searchPath ?? "").split(":")) {
+    if (!dir || !path.isAbsolute(dir)) continue;
+    const candidate = path.join(dir, bin);
+    if (await cloudflaredPresent(candidate)) return candidate;
+  }
+  return bin;
 }
 
 export async function cloudflaredPresent(bin: string): Promise<boolean> {

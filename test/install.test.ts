@@ -14,6 +14,7 @@ import {
   helperLogPath,
   httpPlistPath,
   remoteConnector,
+  resolveClaudeBin,
   resolveCloudflared,
   stableNodeBin,
   tunnelLogPath,
@@ -41,6 +42,8 @@ test("dry-run returns both plists and writes nothing", async () => {
   assert.match(report.httpPlist, /CLAUDE_REMOTE_HTTP_PORT<\/key><string>47321<\/string>/);
   assert.match(report.httpPlist, /CLAUDE_REMOTE_ALLOW_SEND<\/key><string>0<\/string>/);
   assert.match(report.httpPlist, /CLAUDE_REMOTE_ALLOW_LAUNCH<\/key><string>0<\/string>/);
+  assert.match(report.httpPlist, /CLAUDE_REMOTE_CLAUDE_BIN<\/key><string>\/fake\/claude<\/string>/);
+  assert.equal(report.httpPlist.includes("CLAUDE_REMOTE_ALLOW_DELIVER"), false);
   assert.match(report.tunnelPlist, /<key>KeepAlive<\/key><true\/>/);
   assert.match(report.tunnelPlist, /<key>RunAtLoad<\/key><true\/>/);
   assert.match(report.tunnelPlist, /--url/);
@@ -345,6 +348,19 @@ test("install dry-run uses PATH cloudflared and the stable node", async () => {
   assert.match(preview.stdout, new RegExp(node.replaceAll("/", "\\/")));
   assert.equal(preview.stdout.includes("Cellar"), false);
   await assert.rejects(() => stat(tokenPath(home)));
+});
+
+test("install pins the claude CLI it found on PATH", async () => {
+  const { home } = await tempHome();
+  const bin = path.join(home, "bin");
+  await mkdir(bin, { recursive: true });
+  await writeFile(path.join(bin, "claude"), "#!/bin/sh\n");
+  await chmod(path.join(bin, "claude"), 0o755);
+  assert.equal(await resolveClaudeBin("claude", `relative:${bin}`), path.join(bin, "claude"));
+  assert.equal(await resolveClaudeBin("claude", "/nonexistent"), "claude");
+  assert.equal(await resolveClaudeBin("/opt/x/claude", undefined), "/opt/x/claude");
+  const report = await executeInstall(input(home, { dryRun: true, claudeBin: "claude" }), recorder().hooks);
+  assert.equal(report.httpPlist.includes("CLAUDE_REMOTE_CLAUDE_BIN"), false);
 });
 
 function input(home: string, patch: Partial<InstallInput> = {}): InstallInput {
