@@ -199,7 +199,7 @@ An interactive launch has no init event, so `fastMode.state` is `null` there and
 
 `claude agents --json` only says that a session needs you and why (`waitingFor`). The hooks add what it is waiting on, and let an authenticated client answer a permission prompt or an `AskUserQuestion` question remotely.
 
-`install` adds one command handler per event below to the user `settings.json`. Each runs `node <install>/dist/index.js hook --from=claude-remote` in exec form, with no shell. Before it edits the file, `install` copies it to `settings.json.bak-claude-remote-<UTC timestamp>` (mode `0600`). The merge is done in code: every other key and every other hook stays as it was, a second `install` changes nothing, and `uninstall` removes exactly the handlers that carry `--from=claude-remote`, again after a backup. A symlinked `settings.json` is edited at its target. A file that is not valid JSON is left alone, and the error does not quote it. The file can hold secrets in `env`, so it is never printed.
+`install` adds one command handler per event below to the user `settings.json`. Each runs `/bin/sh ~/.claude-remote/http/hook.sh --from=claude-remote` in exec form; the script is described below the table. Before it edits the file, `install` copies it to `settings.json.bak-claude-remote-<UTC timestamp>` (mode `0600`). The merge is done in code: every other key and every other hook stays as it was, a second `install` changes nothing, and `uninstall` removes exactly the handlers that carry `--from=claude-remote`, again after a backup. A symlinked `settings.json` is edited at its target. A file that is not valid JSON is left alone, and the error does not quote it. The file can hold secrets in `env`, so it is never printed.
 
 | Event | Matcher | Mode | What the helper does |
 | --- | --- | --- | --- |
@@ -208,6 +208,8 @@ An interactive launch has no init event, so `fastMode.state` is `null` there and
 | `PreToolUse` | `AskUserQuestion` | blocking, approve timeout + 15 s | Records the questions, headers, and options. With approve on, the hook waits for `answer_question`. |
 | `PostToolUse`, `PostToolUseFailure`, `PermissionDenied` | all tools | `async` | Clears the matching permission or question (same `tool_use_id`, or same tool and input). |
 | `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd` | - | `async` | Clears everything pending for the session. |
+
+`install` writes `~/.claude-remote/http/hook.sh` (mode `0700`), a POSIX `sh` script that forwards each event with the system `curl`, so an event costs a shell and a `curl` rather than a Node start. It behaves like `claude-remote hook`: the same endpoints (in a plain-text variant, `?format=text`), the same 1.5-second registration timeout, the same long-poll for permission requests and questions, and the same fail-open exit 0 with no output when the token is missing, the helper is down, or anything else goes wrong. The helper builds the decision JSON for it with the code the Node hook uses, so both print the same output. The script reads the token with the shell's `read` and gives it to `curl` as a config file on a pipe (`-K /dev/fd/3`), so the token never appears in a process argument list, and it keeps the hook JSON in memory rather than on disk. It reads stdin to the end before doing anything else; a stdin that never closes is ended by the hook timeout in `settings.json`. If `curl` is not on `PATH`, the script runs `node <install>/dist/index.js hook` instead. `uninstall` deletes the script.
 
 `claude-remote hook` reads the hook JSON on stdin and POSTs it to `http://127.0.0.1:<port>/hook/event` with the bearer token from `~/.claude-remote/http/token`. It fails open: if the token is missing, the helper is down or does not answer within 1.5 seconds, or anything else goes wrong, it exits 0 with no output, which Claude Code treats as no decision. A watchdog ends the process after 2.5 seconds unless it is waiting for an answer. The hook loads only Node built-ins, so it starts quickly. The `/hook/*` endpoints need the same token and refuse any request that carries Cloudflare or proxy forwarding headers, so they cannot be reached through the tunnel.
 
@@ -223,6 +225,29 @@ With `CLAUDE_REMOTE_ALLOW_APPROVE=1`, a `PermissionRequest` or `AskUserQuestion`
 Per the Claude Code hook docs, the terminal runs the `PermissionRequest` hook before it shows its own dialog, so with approve on the local prompt is expected to appear only after the remote window closes (this ordering has been checked with `claude -p`, not in an interactive terminal). In the Desktop app, which hosts Claude Code through the SDK permission callback, the hook runs alongside the app's own prompt and whichever answers first wins. Keep the timeout short if you also answer locally. Without approve the hooks only report, and return at once. In `claude -p` runs there is no local prompt: if nobody answers in time, Claude Code denies the call, and `AskUserQuestion` is not offered at all.
 
 A question can also be answered by sending a normal message (`send_followup` or `deliver_message`) once the question has timed out to the normal prompt.
+
+### Push alerts
+
+The helper can POST a small JSON event to a URL of your choice when a new pending entry appears, so a phone or a webhook-triggered routine hears about a waiting prompt without polling `list_pending`. It is off unless configured.
+
+```bash
+CLAUDE_REMOTE_NOTIFY_SECRET='<16+ characters>' node dist/index.js install --allow-approve --notify-url=https://example.com/hooks/claude
+node dist/index.js install --notify-url=https://example.com/hooks/claude --notify-include-text --notify-cleared
+```
+
+`install` writes the URL and secret to `~/.claude-remote/http/notify.json` (mode `0600`); neither goes in the plist. The secret can also be passed as `--notify-secret=<value>`, but the environment keeps it out of the process list and shell history. Running `install` without `--notify-url` turns alerts off and deletes the file, and `uninstall` deletes it too. A foreground `node dist/index.js http` also reads `CLAUDE_REMOTE_NOTIFY_URL`, `CLAUDE_REMOTE_NOTIFY_SECRET`, `CLAUDE_REMOTE_NOTIFY_AUTH`, `CLAUDE_REMOTE_NOTIFY_INCLUDE_TEXT`, and `CLAUDE_REMOTE_NOTIFY_CLEARED`, which take precedence over the file. The URL must be `https`, or `http` to `127.0.0.1` or `localhost`.
+
+Each new permission request, question, or notification produces exactly one `pending` event. The `permission_prompt` notification Claude Code sends a few seconds after a permission request is not sent again. With `--notify-cleared` the endpoint also gets one `cleared` event when an alerted entry goes away. The body is:
+
+```json
+{"type":"claude-remote.pending","event":"pending","eventId":"<requestId>.pending","requestId":"...","sessionId":"...","projectName":"my-app","kind":"permission","toolName":"Bash","notificationType":null,"createdAt":"...","sentAt":"...","answerable":true}
+```
+
+The question, message, or tool-input text is left out unless `--notify-include-text` (`CLAUDE_REMOTE_NOTIFY_INCLUDE_TEXT=1`) adds `text`, `title`, and `questions`. Pass `requestId` and `sessionId` to `get_session`, `list_pending`, or `answer_permission`.
+
+With a secret, each request carries `X-Claude-Remote-Timestamp` (Unix seconds) and `X-Claude-Remote-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<raw body>" keyed by the secret>`. Check it with a constant-time compare and reject old timestamps. `--notify-auth=bearer` sends `Authorization: Bearer <secret>` instead, for receivers that can only match a static header. `X-Claude-Remote-Delivery` repeats `eventId` for deduplication.
+
+Delivery is fire-and-forget: a 3-second timeout, two retries (after 0.5 and 2 seconds) on a network error, 429, or 5xx, no redirects, and at most 100 queued events. A hook never waits for it. Logs record only `sent`, `failed-<status>`, or `dropped`, never the URL, the secret, or any text.
 
 ## Deliver a message to a live session (experimental)
 
