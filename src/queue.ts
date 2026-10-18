@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { RunState, WorktreeLaunch } from "./domain.js";
+import type { RunState, StatusValue, WorktreeLaunch } from "./domain.js";
 import { DeskError, assertNever } from "./domain.js";
 import { sessionRecordName } from "./paths.js";
 import { processAlive } from "./registry.js";
@@ -50,7 +50,7 @@ export type FollowupOutcome =
       disposition: "handed";
       sessionId: string;
       offerId: string;
-      observedStatus: string | null;
+      observedStatus: StatusValue | null;
       displayedInDesktop: false;
       notice: string;
       attachments?: StagedAttachmentView[];

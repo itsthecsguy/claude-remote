@@ -105,7 +105,7 @@ test("a busy session queues the event behind the current turn", async () => {
     ]);
     assert.equal(outcome.disposition, "handed");
     if (outcome.disposition !== "handed") return;
-    assert.equal(outcome.observedStatus, "busy");
+    assert.equal(outcome.observedStatus, "working");
     assert.equal(outcome.displayedInDesktop, false);
     await assert.rejects(() => stat(path.join(project, "fake-claude-record.json")));
   } finally {

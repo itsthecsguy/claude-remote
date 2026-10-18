@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { lstat, readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { EntrypointOwner, SessionId, SessionRegistry } from "./domain.js";
+import type { EntrypointOwner, ProcessDetailsView, SessionId, SessionRegistry } from "./domain.js";
 import { DeskError, assertNever } from "./domain.js";
 import { allowSessionRecord, parseSessionId, sessionRecordName } from "./paths.js";
 
@@ -26,7 +26,17 @@ export type LiveRecord = {
   cwd: string | null;
   entrypoint: EntrypointOwner;
   mtimeMs: number;
+  pid: number;
+  status: string | null;
+  process: ProcessDetails;
 };
+
+/**
+ * Fields from sessions/<pid>.json that `claude agents --json` does not carry. tmux is the tmux
+ * target the session runs in, bridgeSessionId is the Remote Control bridge id, and
+ * messagingSocketPath is the cross-session inbox socket.
+ */
+export type ProcessDetails = ProcessDetailsView;
 
 export async function loadSessionRegistry(
   configRoot: string,
@@ -35,7 +45,15 @@ export async function loadSessionRegistry(
 ): Promise<SessionRegistry> {
   const read = await readRegistry(configRoot, home, identity);
   if (read.status !== "checked") return { status: read.status };
-  return { status: "checked", live: read.live, unverified: read.unverified, owners: read.owners };
+  const tokens: Record<string, string> = {};
+  const details: Record<string, ProcessDetails> = {};
+  for (const record of read.records) {
+    if (record.status && tokens[record.sessionId] == null) tokens[record.sessionId] = record.status;
+    if (details[record.sessionId] == null || rank(record.entrypoint) > rank(details[record.sessionId]!.entrypoint)) {
+      details[record.sessionId] = record.process;
+    }
+  }
+  return { status: "checked", live: read.live, unverified: read.unverified, owners: read.owners, tokens, details };
 }
 
 export async function loadLiveRecords(
@@ -98,6 +116,15 @@ async function readRegistry(
         cwd: verdict.cwd,
         entrypoint: verdict.entrypoint,
         mtimeMs: verdict.mtimeMs,
+        pid: verdict.pid,
+        status: verdict.status,
+        process: {
+          pid: verdict.pid,
+          entrypoint: verdict.entrypoint,
+          tmux: verdict.tmux,
+          bridgeSessionId: verdict.bridgeSessionId,
+          messagingSocketPath: verdict.messagingSocketPath,
+        },
       });
     } else {
       unverified.push(verdict.sessionId);
@@ -160,7 +187,7 @@ async function verdictFor(
   name: string,
   identity: ProcessIdentityLookup,
 ): Promise<
-  | { kind: "live"; sessionId: SessionId; entrypoint: EntrypointOwner; cwd: string | null; mtimeMs: number }
+  | ({ kind: "live"; mtimeMs: number; pid: number } & ParsedRecord)
   | { kind: "unverified"; sessionId: SessionId }
   | { kind: "skip" }
 > {
@@ -184,10 +211,9 @@ async function verdictFor(
   if (!procStartMatches(parsed.procStart, found.startToken)) return { kind: "skip" };
   const fileStat = await stat(file).catch(() => null);
   return {
+    ...parsed,
     kind: "live",
-    sessionId: parsed.sessionId,
-    entrypoint: parsed.entrypoint,
-    cwd: parsed.cwd,
+    pid: filenamePid,
     mtimeMs: fileStat?.mtimeMs ?? 0,
   };
 }
@@ -215,7 +241,19 @@ function rank(owner: EntrypointOwner): number {
   }
 }
 
-function parseRecord(text: string): { sessionId: SessionId; pid: number | null; procStart: string | null; entrypoint: EntrypointOwner; cwd: string | null } | null {
+type ParsedRecord = {
+  sessionId: SessionId;
+  pid: number | null;
+  procStart: string | null;
+  entrypoint: EntrypointOwner;
+  cwd: string | null;
+  status: string | null;
+  tmux: string | null;
+  bridgeSessionId: string | null;
+  messagingSocketPath: string | null;
+};
+
+function parseRecord(text: string): ParsedRecord | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -223,7 +261,17 @@ function parseRecord(text: string): { sessionId: SessionId; pid: number | null; 
     return null;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-  const record = parsed as { sessionId?: unknown; pid?: unknown; procStart?: unknown; entrypoint?: unknown; cwd?: unknown };
+  const record = parsed as {
+    sessionId?: unknown;
+    pid?: unknown;
+    procStart?: unknown;
+    entrypoint?: unknown;
+    cwd?: unknown;
+    status?: unknown;
+    tmux?: unknown;
+    bridgeSessionId?: unknown;
+    messagingSocketPath?: unknown;
+  };
   if (typeof record.sessionId !== "string") return null;
   const sessionId = parseSessionId(record.sessionId);
   if (!sessionId) return null;
@@ -233,7 +281,30 @@ function parseRecord(text: string): { sessionId: SessionId; pid: number | null; 
     procStart: procStartValue(record.procStart),
     entrypoint: entrypointOwner(record.entrypoint),
     cwd: cwdValue(record.cwd),
+    status: typeof record.status === "string" && STATUS_TOKEN.test(record.status) ? record.status : null,
+    tmux: tmuxValue(record.tmux),
+    bridgeSessionId: bridgeValue(record.bridgeSessionId),
+    messagingSocketPath: socketValue(record.messagingSocketPath),
   };
+}
+
+const TMUX_VALUE = /^[A-Za-z0-9_.:%$@#-]{1,128}$/;
+const BRIDGE_VALUE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function tmuxValue(value: unknown): string | null {
+  return typeof value === "string" && TMUX_VALUE.test(value) ? value : null;
+}
+
+function bridgeValue(value: unknown): string | null {
+  return typeof value === "string" && BRIDGE_VALUE.test(value) ? value : null;
+}
+
+/** An absolute path ending in .sock, with no NUL, no .key, and no .. segment. */
+export function socketValue(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 512) return null;
+  if (!value.startsWith("/") || !value.endsWith(".sock")) return null;
+  if (value.includes("\0") || value.includes(".key") || value.split("/").includes("..")) return null;
+  return value;
 }
 
 function cwdValue(value: unknown): string | null {

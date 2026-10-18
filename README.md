@@ -141,20 +141,68 @@ These are the method names.
 | `new_session` | `CLAUDE_REMOTE_ALLOW_LAUNCH=1` |
 | `continue_session` | `CLAUDE_REMOTE_ALLOW_LAUNCH=1` |
 | `stop_session` | `CLAUDE_REMOTE_ALLOW_LAUNCH=1` |
+| `deliver_message` | `CLAUDE_REMOTE_ALLOW_DELIVER=1`. Experimental. The call still has to set `confirm` to true. |
 
 `install --allow-send` registers `send_followup` and `queue_status`. `install --allow-launch` registers `new_session`, `continue_session`, and `stop_session`. With both flags the registered methods are `list_sessions`, `get_session`, `continue_command`, `rename_session`, `cleanup_desk`, `send_followup`, `queue_status`, `new_session`, `continue_session`, and `stop_session`.
 
+`deliver_message` is not part of either install flag. `install` never sets `CLAUDE_REMOTE_ALLOW_DELIVER`, so it is only registered when you export it yourself for a foreground `http`.
+
 `send_followup` does nothing unless `confirm` is true. `continue_session` refuses a live owner unless `confirmLiveOwner` is true, and it still refuses while that pid is alive. `new_session` and `continue_session` send Enter on the development-channels prompt only when `acceptDevChannelPrompt` is true and the highlighted line is the accept option. Trust, a new MCP server prompt, and the Chrome extension prompt are not answered. If one of those panes is up and no session id has been written yet, the result is `code=blocked-by-dialog` with `dialog` set to `workspace-trust`, `mcp-server`, or `chrome-extension`.
+
+## Session status
+
+`list_sessions` and `get_session` read status from `claude agents --json --all`, which the Claude Code docs name as the supported way to read session state from outside Claude Code. Each card has a `status` object:
+
+| `claude agents --json` | `status.value` |
+| --- | --- |
+| `status: busy` | `working` |
+| `status: waiting` | `needs-you`, with `waitingFor` (`permission prompt`, `input needed`, `sandbox request`, `worker request`, `dialog open`, or `other`) |
+| `status: idle` | `idle` |
+| background `state: working` | `working` |
+| background `state: blocked` | `needs-you` |
+| background `state: done` | `idle` |
+| background `state: failed` or `stopped` | `failed` or `stopped` |
+| not listed, transcript closed | `not-running` |
+
+A background session uses `state`. `status.source` is `agents-json` when the value came from that command. Only `kind`, `pid`, `sessionId`, `id`, `status`, `state`, and `waitingFor` are kept from its output; `cwd` and `name` are dropped. When the command is missing, fails, times out, or prints something that is not a JSON array (an older CLI), the server falls back: a live session uses the `status` token in `~/.claude/sessions/<pid>.json` mapped the same way (`source: sessions-file`), and anything else uses the run state (`source: fallback`). `CLAUDE_REMOTE_AGENTS_JSON=0` turns the command off. The `stuck` line in `get_session` follows `status` when it came from `agents-json`, and keeps the transcript-tail heuristic otherwise. The `observedStatus` field on a `handed` send uses the same values.
+
+While a process is live, `process` carries what `claude agents --json` does not: `entrypoint` (`desktop`, `terminal`, `other`), `tmux`, `bridgeSessionId`, and `messagingSocketPath`, read from `~/.claude/sessions/<pid>.json`.
+
+## Sub-sessions
+
+Each card lists subagent transcripts under `~/.claude/projects/<project>/<sessionId>/subagents/agent-<id>.jsonl` as `subSessions`, newest first. A row has `agentId`, `agentType`, `isFork`, `spawnDepth`, `finished`, `parentAgentId`, `worktree`, `sizeBytes`, and `lastActivity`. They come from the file's stat and its `agent-<id>.meta.json` sidecar. The subagent transcript itself is never opened, and the meta `description` is not returned. `list_sessions` shows up to 20 rows per card, and `subSessionCount` is the total. `get_session` returns every row. Symlinked files or folders are skipped.
+
+## Launch options
+
+`new_session` takes these optional fields. Each one is checked before anything runs, and every value is passed as its own argv entry, never through a shell.
+
+| Field | What it runs |
+| --- | --- |
+| `worktree` | `true` adds `--worktree`. A name (letters, digits, `.`, `-`, `_`, up to 64, starting with a letter or digit) adds `--worktree <name>`. |
+| `fastMode` | `true` adds `--settings '{"fastMode":true}'`. Off unless set, because fast mode bills extra usage. That exact value is the only `--settings` value the server will pass. |
+| `prompt` | Starts a headless `claude -p --output-format stream-json --verbose` session with the prompt on stdin, reads the `system/init` event, and returns the session id and `fastMode.state` (`fast_mode_state`: `on`, `off`, or `cooldown`) with `fastMode.disabledReason`. The process keeps running detached; its output is dropped. `stop_session` can end it. |
+| `cloud` | A task description. Runs `claude --cloud "<description>"` in tmux, because that form needs a terminal, and returns `cloudSessionId` and `cloudUrl` once the CLI prints them. A description that starts with `-`, or looks like `session_...`, `cse_...`, or a URL, is refused, since that form sends into an existing cloud session. |
+| `environment` | A `ccpool_` id. Needs `cloud`. Runs `claude -p "<description>" --environment <id> --output-format json` and returns the session id from `{ok, session_id, url}`. |
+
+An interactive launch has no init event, so `fastMode.state` is `null` there and `fastMode.source` is `no-init-event`. `cloud` does not combine with `worktree`, `fastMode`, or `prompt`.
+
+`claude --worktree` refuses to run in a folder whose workspace trust has not been accepted yet. An interactive launch then fails with `session-unobserved` and a hint. Headless (`prompt`) launches skip the trust dialog, as `claude -p` always does, and do create the worktree. To fix it, open `claude` in that folder once and accept the trust dialog. The launcher never accepts trust for you. In headless runs the init event reports `fast_mode_state: "off"` with `fast_mode_disabled_reason: "sdk_opt_in_required"` unless `fastMode: true` is set.
+
+## Deliver a message to a live session (experimental)
+
+`deliver_message` puts text in the cross-session inbox of a live session, including a session open in the Desktop app, without resuming it or closing the app. It uses the documented route: a short `claude -p` worker whose only tool is `SendMessage` (`--tools SendMessage --strict-mcp-config --no-session-persistence`) is asked to send the text to `uds:<messagingSocketPath>` from the target's `~/.claude/sessions/<pid>.json`. The text goes to the worker on stdin. The server never writes to the socket itself, because that format is not documented.
+
+The result is `delivered` only when the worker made exactly one `SendMessage` call, to that address, and the call reported success. `verbatim` says whether the sent text matched. The receiving session still applies its own inbound rules. A session that prompts for permissions takes the message; a session that bypasses permission prompts holds it, and a Desktop or `-p` session cannot show the approval dialog, so a held message expires after five minutes by default. `delivered` means the message reached the inbox, not that Claude has read it. The worker is a model call: the text is fenced and the worker is told not to follow instructions inside it, and the result checks the target, but a worker run costs a small amount of usage.
 
 ## Safety
 
-`CLAUDE_REMOTE_ALLOW_SEND` and `CLAUDE_REMOTE_ALLOW_LAUNCH` are opt-in. A default `install` leaves both off.
+`CLAUDE_REMOTE_ALLOW_SEND`, `CLAUDE_REMOTE_ALLOW_LAUNCH`, and `CLAUDE_REMOTE_ALLOW_DELIVER` are opt-in. A default `install` leaves them off.
 
 The server does not open `~/.claude/sessions/*.key`, `~/.claude/.credentials.json`, `~/.claude.json`, or anything under `~/.config/anthropic`. A session id that is not a UUID is rejected before any path is joined. A symlink whose target leaves the transcript directory is refused.
 
 Logs may include a tool name, a session id, a ticket id, a duration, an exit code, and a short code such as `unauthorized`, `host-rejected`, `origin-rejected`, `start`, `end`, or `error`. They do not include the bearer token, a header value, a message, transcript text, or file text.
 
-The server does not pass permission-bypass flags. That includes `--dangerously-skip-permissions`, `--permission-mode`, and `--allow-dangerously-skip-permissions`.
+The server does not pass permission-bypass flags. That includes `--dangerously-skip-permissions`, `--permission-mode`, and `--allow-dangerously-skip-permissions`. `--settings` is refused unless its value is exactly `{"fastMode":true}`.
 
 `list_sessions` does not stat or resolve a working directory under Desktop, Documents, Downloads, `Library/Mobile Documents`, or `Library/CloudStorage`. Those are the macOS protected folders, including iCloud.
 

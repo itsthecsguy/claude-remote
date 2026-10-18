@@ -23,6 +23,47 @@ export type SessionCard = {
   messageCount: number;
   command: string | null;
   warning: string | null;
+  status: SessionStatus;
+  process: ProcessDetailsView | null;
+  subSessions: SubSessionRow[];
+  subSessionCount: number;
+};
+
+export type WaitingFor =
+  | "permission prompt"
+  | "input needed"
+  | "sandbox request"
+  | "worker request"
+  | "dialog open"
+  | "other";
+
+export type StatusValue = "working" | "needs-you" | "idle" | "failed" | "stopped" | "not-running" | "unknown";
+
+export type StatusSource = "agents-json" | "sessions-file" | "fallback";
+
+export type SessionStatus = {
+  value: StatusValue;
+  waitingFor: WaitingFor | null;
+  source: StatusSource;
+  kind: "interactive" | "background" | "other" | null;
+};
+
+/**
+ * One subagent transcript under <project>/<sessionId>/subagents/, built from the file's stat and
+ * its .meta.json sidecar. The transcript itself is never opened.
+ */
+export type SubSessionRow = {
+  agentId: string;
+  parentSessionId: SessionId;
+  agentType: string | null;
+  isFork: boolean;
+  spawnDepth: number | null;
+  finished: boolean | null;
+  parentAgentId: string | null;
+  worktree: boolean;
+  sizeBytes: number;
+  lastActivity: string | null;
+  hasMeta: boolean;
 };
 
 export type Turn = {
@@ -64,7 +105,17 @@ export type SessionRegistry =
       live: readonly SessionId[];
       unverified: readonly SessionId[];
       owners: Readonly<Record<string, EntrypointOwner>>;
+      tokens?: Readonly<Record<string, string>>;
+      details?: Readonly<Record<string, ProcessDetailsView>>;
     };
+
+export type ProcessDetailsView = {
+  pid: number;
+  entrypoint: EntrypointOwner;
+  tmux: string | null;
+  bridgeSessionId: string | null;
+  messagingSocketPath: string | null;
+};
 
 export type WorktreeLaunch = "project" | "main-checkout" | "unchecked";
 

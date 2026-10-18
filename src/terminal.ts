@@ -1,6 +1,6 @@
 import { DEV_CHANNELS_FLAG, CHANNEL_SERVER, shellQuote, shellToken } from "./continue.js";
-import { DeskError } from "./domain.js";
 import { FORBIDDEN_FLAGS } from "./followup.js";
+import { assertNoBypass } from "./launch-options.js";
 
 export const DEV_CHANNEL_WARNING = "WARNING: Loading development channels";
 export const DEV_CHANNEL_ACCEPT = "1. I am using this for local development";
@@ -38,15 +38,12 @@ export function terminalArgs(
   bin: string,
   sessionId: string | null,
   extra: { addDir: string; mcpConfig: string },
+  launchFlags: readonly string[] = [],
 ): string[] {
-  const args = [bin, "--add-dir", extra.addDir, "--mcp-config", extra.mcpConfig, "--no-chrome"];
+  const args = [bin, "--add-dir", extra.addDir, "--mcp-config", extra.mcpConfig, "--no-chrome", ...launchFlags];
   if (sessionId) args.push("--resume", sessionId);
   args.push(DEV_CHANNELS_FLAG, `server:${CHANNEL_SERVER}`);
-  for (const arg of args) {
-    if ((FORBIDDEN_FLAGS as readonly string[]).includes(arg)) {
-      throw new DeskError("denied", "refusing a permission-bypass flag");
-    }
-  }
+  assertNoBypass(args.slice(1), FORBIDDEN_FLAGS);
   return args;
 }
 

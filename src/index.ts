@@ -5,6 +5,7 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { runChannelMode } from "./channel-host.js";
 import { isDeskCommand, runCli } from "./cli.js";
 import { parseConfig } from "./config.js";
+import { registerDeliverTool } from "./deliver.js";
 import { registerLaunchTools } from "./launch.js";
 import { registerTools } from "./tools.js";
 
@@ -36,5 +37,6 @@ serveStdio(() => {
   const server = new McpServer({ name: "claude-remote", version: "0.1.0" });
   registerTools(server, config);
   registerLaunchTools(server, config);
+  registerDeliverTool(server, config);
   return server;
 });

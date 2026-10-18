@@ -18,7 +18,7 @@ import {
 } from "./channel.js";
 import { classifyLiveOwner, continueCommandLine, liveWriterWarning } from "./continue.js";
 import type { Config } from "./config.js";
-import type { LiveOwner, SessionCard, SessionDetail, SessionRegistry, TailEnd, WorktreeLaunch } from "./domain.js";
+import type { LiveOwner, ProcessDetailsView, SessionCard, SessionDetail, SessionRegistry, SessionStatus, SubSessionRow, TailEnd, WorktreeLaunch } from "./domain.js";
 import { DeskError, assertNever } from "./domain.js";
 import { loadDesktopIndex, recordedWorkingFolder, resolveDesktopRoot, sessionTitle, type DesktopMeta } from "./desktop.js";
 import { DESKTOP_NOTICE, followupInvocation, resolveSpawnCwd, skipsFolderProbe, spawnClaude } from "./followup.js";
@@ -44,6 +44,8 @@ import { loadLiveRecords, loadSessionRegistry, observedRegistryStatus, processId
 import { readTranscript, type TranscriptFacts } from "./read.js";
 import { classifyRunState, listCmdlines, runStateEvidence, tailFlag } from "./running.js";
 import { summarize } from "./summary.js";
+import { loadAgents, resolveStatus, statusFromEntry, statusFromToken, type AgentsLoader, type AgentsSnapshot } from "./agents.js";
+import { listSubSessions } from "./subagents.js";
 
 export type ListResult = {
   sessions: SessionCard[];
@@ -72,7 +74,14 @@ export type QueueStatusResult = {
 
 export type CommandLister = () => Promise<string[]>;
 
-const LIST_DESCRIPTION = "List local coding sessions. Each row has the sidebar title when the session is joined, otherwise the transcript title, the project name, cwd as the recorded working folder, run state, liveOwner, the continue command, and the live-owner warning. A session with no transcript yet is included when sessions/<pid>.json names it and that pid is alive with a matching procStart, or when its channel socket accepts a connection. liveOwner is desktop, terminal, none, or unknown. cwd is not the encoded project directory name. The page has no transcript text. A running state with evidence sessions-file means the registry file is live. If the start time cannot be checked, the state is unknown. finished means there is no live marker and the tail is closed. It does not mean the coding task succeeded. Transcript rows are paged by file mtime. Live sessions that have no transcript are added after that page.";
+/** Sub-session rows shown per card in list_sessions. get_session returns all of them. */
+const LIST_SUB_ROWS = 20;
+
+export function defaultAgentsLoader(config: Config): AgentsLoader {
+  return () => loadAgents(config.claudeBin, { disabled: !config.agentsJson });
+}
+
+const LIST_DESCRIPTION = "List local coding sessions. Each row has the sidebar title when the session is joined, otherwise the transcript title, the project name, cwd as the recorded working folder, run state, status, liveOwner, the continue command, and the live-owner warning. status.value comes from claude agents --json: busy is working, waiting is needs-you with waitingFor, idle is idle, and a background session uses its state (working, blocked as needs-you, done as idle, failed, stopped). A session agents --json does not list is not-running. When that command is missing or fails, status falls back to the sessions/<pid>.json token and status.source says so. process carries entrypoint, tmux, bridgeSessionId, and messagingSocketPath from sessions/<pid>.json while the process is live. subSessions lists subagent transcripts under the session (agentType, isFork, spawnDepth, finished, size, last write) from file stats and .meta.json only, up to 20 per row; subSessionCount is the total. A session with no transcript yet is included when sessions/<pid>.json names it and that pid is alive with a matching procStart, or when its channel socket accepts a connection. liveOwner is desktop, terminal, none, or unknown. cwd is not the encoded project directory name. The page has no transcript text. A running state with evidence sessions-file means the registry file is live. If the start time cannot be checked, the state is unknown. finished means there is no live marker and the tail is closed. It does not mean the coding task succeeded. Transcript rows are paged by file mtime. Live sessions that have no transcript are added after that page.";
 
 const GET_DESCRIPTION = "Read one local coding session. Returns recent tail turns and a short extractive summary. The stuck line is session is running, a tool error, a tool call with no result, or waiting on a reply. The first match wins.";
 
@@ -91,6 +100,7 @@ export async function listSessions(
   input: { project?: string; limit?: number },
   lister: CommandLister = listCmdlines,
   identity: ProcessIdentityLookup = processIdentity,
+  agents: AgentsLoader = defaultAgentsLoader(config),
 ): Promise<ListResult> {
   const started = Date.now();
   try {
@@ -101,6 +111,7 @@ export async function listSessions(
     const page = candidates.slice(0, limit);
     const registry = await loadSessionRegistry(config.configRoot, config.home, identity);
     const cmdlines = await lister();
+    const snapshot = await agents();
     const desktop = await loadDesktopIndex(await resolveDesktopRoot(config), config.home);
     const cards: SessionCard[] = [];
     const built = await mapLimited(page, 6, async (candidate) => {
@@ -112,18 +123,25 @@ export async function listSessions(
         tail: tailFlag(facts.end, facts.incomplete),
       });
       const meta = desktop.get(candidate.sessionId);
-      return decorateCard(config, buildCard(facts, meta, runState, liveOwnerFor(registry, candidate.sessionId, cmdlines, runState)));
+      const subs = await listSubSessions(config.configRoot, candidate.filePath, candidate.sessionId, config.home);
+      const card = buildCard(facts, meta, runState, liveOwnerFor(registry, candidate.sessionId, cmdlines, runState), {
+        status: statusFor(snapshot, registry, candidate.sessionId, runState),
+        process: processFor(registry, candidate.sessionId, runState),
+        subSessions: subs.slice(0, LIST_SUB_ROWS),
+        subSessionCount: subs.length,
+      });
+      return decorateCard(config, card);
     });
     for (const card of built) {
       if (matchesProject(card, input.project)) cards.push(card);
     }
     const known = new Set(candidates.map((candidate) => candidate.sessionId));
-    const extras = await unwrittenCards(config, known, lister, identity);
+    const extras = await unwrittenCards(config, known, lister, identity, snapshot);
     extras.sort(byActivity);
     for (const extra of extras) {
       if (matchesProject(extra, input.project)) cards.push(extra);
     }
-    logEvent({ tool: "list_sessions", durationMs: Date.now() - started });
+    logEvent({ tool: "list_sessions", durationMs: Date.now() - started, evidence: snapshot.available ? "agents-json" : `agents-${snapshot.reason}` });
     return { sessions: cards, scannedFileCount, pagedBy: "mtime" };
   } catch (error) {
     if (error instanceof DeskError) logEvent({ tool: "list_sessions", durationMs: Date.now() - started, code: error.code });
@@ -136,6 +154,7 @@ export async function getSession(
   input: { sessionId: string },
   lister: CommandLister = listCmdlines,
   identity: ProcessIdentityLookup = processIdentity,
+  agents: AgentsLoader = defaultAgentsLoader(config),
 ): Promise<SessionDetail> {
   const started = Date.now();
   let safeId: string | undefined;
@@ -150,7 +169,7 @@ export async function getSession(
       if (!(error instanceof DeskError) || error.code !== "not-found") throw error;
     }
     if (!filePath) {
-      const card = await oneUnwritten(config, id, lister, identity);
+      const card = await oneUnwritten(config, id, lister, identity, await agents());
       if (!card) throw new DeskError("not-found", "session not found");
       logEvent({
         tool: "get_session",
@@ -172,14 +191,22 @@ export async function getSession(
     });
     const desktop = await loadDesktopIndex(await resolveDesktopRoot(config), config.home);
     const meta = desktop.get(id);
-    const card = await decorateCard(config, buildCard(facts, meta, runState, liveOwnerFor(registry, id, cmdlines, runState)));
+    const snapshot = await agents();
+    const status = statusFor(snapshot, registry, id, runState);
+    const subs = await listSubSessions(config.configRoot, filePath, id, config.home);
+    const card = await decorateCard(config, buildCard(facts, meta, runState, liveOwnerFor(registry, id, cmdlines, runState), {
+      status,
+      process: processFor(registry, id, runState),
+      subSessions: subs,
+      subSessionCount: subs.length,
+    }));
     logEvent({
       tool: "get_session",
       sessionId: id,
       durationMs: Date.now() - started,
       evidence: runStateEvidence(runState),
     });
-    return { card, turns: facts.turns, summary: summarize(facts, runState), lastReply: facts.lastReply };
+    return { card, turns: facts.turns, summary: summarize(facts, runState, status), lastReply: facts.lastReply };
   } catch (error) {
     if (error instanceof DeskError) {
       logEvent({ tool: "get_session", sessionId: safeId, durationMs: Date.now() - started, code: error.code });
@@ -287,7 +314,7 @@ export async function continueCommand(
       if (!(error instanceof DeskError) || error.code !== "not-found") throw error;
     }
     if (!filePath) {
-      const card = await oneUnwritten(config, id, lister, identity);
+      const card = await oneUnwritten(config, id, lister, identity, NO_AGENTS);
       if (!card?.cwd) throw new DeskError(card ? "missing-cwd" : "not-found", card ? "session directory does not exist" : "session not found");
       const spawnAt = await commandDirectory(card.cwd, config.home);
       logEvent({
@@ -602,7 +629,7 @@ async function offerIfListening(
   const offer = await offerChannel(listenerSocket(config.home, id), message, id, CHANNEL_OFFER_MS);
   if (offer.accepted) {
     const offerId = randomUUID();
-    const observedStatus = await observedRegistryStatus(config.configRoot, config.home, id);
+    const observedStatus = await observedSessionStatus(config, id);
     logEvent({
       tool: "send_followup",
       sessionId: id,
@@ -628,6 +655,19 @@ async function offerIfListening(
     return undelivered(id, reason ?? "running", started, staged);
   }
   return null;
+}
+
+/**
+ * The mapped status of a session that just took a channel frame: the claude agents --json entry
+ * when there is one, otherwise the sessions/<pid>.json token mapped the same way.
+ */
+async function observedSessionStatus(config: Config, id: string): Promise<SessionStatus["value"] | null> {
+  const snapshot = await defaultAgentsLoader(config)();
+  if (snapshot.available) {
+    const entry = snapshot.bySession.get(id);
+    if (entry) return statusFromEntry(entry).value;
+  }
+  return statusFromToken(await observedRegistryStatus(config.configRoot, config.home, id));
 }
 
 function undelivered(id: string, reason: QueueReason | null, started: number, staged: StagedBundle | null = null): FollowupOutcome {
@@ -791,6 +831,7 @@ async function unwrittenCards(
   known: Set<string>,
   lister: CommandLister,
   identity: ProcessIdentityLookup,
+  snapshot: AgentsSnapshot,
 ): Promise<SessionCard[]> {
   const records = await loadLiveRecords(config.configRoot, config.home, identity);
   const cmdlines = await lister();
@@ -801,24 +842,27 @@ async function unwrittenCards(
   for (const record of records) {
     if (seen.has(record.sessionId)) continue;
     seen.add(record.sessionId);
-    cards.push(await decorateCard(config, registryCard(record, cmdlines)));
+    cards.push(await decorateCard(config, registryCard(record, cmdlines, snapshot)));
   }
   for (const raw of sockets) {
     const id = parseSessionId(raw);
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    cards.push(await decorateCard(config, socketCard(id, launches, cmdlines)));
+    cards.push(await decorateCard(config, socketCard(id, launches, cmdlines, snapshot)));
   }
   return cards;
 }
+
+const NO_AGENTS: AgentsSnapshot = { available: false, reason: "disabled" };
 
 async function oneUnwritten(
   config: Config,
   id: string,
   lister: CommandLister,
   identity: ProcessIdentityLookup,
+  snapshot: AgentsSnapshot,
 ): Promise<SessionCard | null> {
-  const cards = await unwrittenCards(config, new Set(), lister, identity);
+  const cards = await unwrittenCards(config, new Set(), lister, identity, snapshot);
   return cards.find((card) => card.sessionId === id) ?? null;
 }
 
@@ -831,7 +875,7 @@ async function sendUnwritten(
   lister: CommandLister,
   identity: ProcessIdentityLookup,
 ): Promise<FollowupOutcome> {
-  const card = await oneUnwritten(config, id, lister, identity);
+  const card = await oneUnwritten(config, id, lister, identity, NO_AGENTS);
   if (!card) throw new DeskError("not-found", "session not found");
   if (mode === "steer") {
     logEvent({ tool: "send_followup", sessionId: id, durationMs: Date.now() - started, code: "unsupported" });
@@ -862,13 +906,15 @@ async function sendUnwritten(
   }
 }
 
-function registryCard(record: LiveRecord, cmdlines: readonly string[]): SessionCard {
+function registryCard(record: LiveRecord, cmdlines: readonly string[], snapshot: AgentsSnapshot): SessionCard {
   const runState: SessionCard["runState"] = { kind: "running", evidence: "sessions-file" };
   return blankCard({
     sessionId: record.sessionId,
     cwd: record.cwd,
     lastActivity: record.mtimeMs > 0 ? new Date(record.mtimeMs).toISOString() : null,
     runState,
+    status: resolveStatus({ snapshot, sessionId: record.sessionId, runState, registryToken: record.status }),
+    process: record.process,
     liveOwner: classifyLiveOwner({
       runState,
       sessionId: record.sessionId,
@@ -878,7 +924,12 @@ function registryCard(record: LiveRecord, cmdlines: readonly string[]): SessionC
   });
 }
 
-function socketCard(id: SessionCard["sessionId"], launches: readonly LaunchRecord[], cmdlines: readonly string[]): SessionCard {
+function socketCard(
+  id: SessionCard["sessionId"],
+  launches: readonly LaunchRecord[],
+  cmdlines: readonly string[],
+  snapshot: AgentsSnapshot,
+): SessionCard {
   const cwd = launchCwd(launches, id);
   const runState: SessionCard["runState"] = { kind: "running", evidence: "process-argv" };
   const started = launches.find((record) => record.sessionId === id)?.startedAt ?? null;
@@ -887,6 +938,8 @@ function socketCard(id: SessionCard["sessionId"], launches: readonly LaunchRecor
     cwd,
     lastActivity: started,
     runState,
+    status: resolveStatus({ snapshot, sessionId: id, runState, registryToken: null }),
+    process: null,
     liveOwner: classifyLiveOwner({
       runState,
       sessionId: id,
@@ -912,6 +965,8 @@ function blankCard(input: {
   cwd: string | null;
   lastActivity: string | null;
   runState: SessionCard["runState"];
+  status: SessionStatus;
+  process: ProcessDetailsView | null;
   liveOwner: LiveOwner;
 }): SessionCard {
   return {
@@ -930,6 +985,10 @@ function blankCard(input: {
     messageCount: 0,
     command: null,
     warning: null,
+    status: input.status,
+    process: input.process,
+    subSessions: [],
+    subSessionCount: 0,
   };
 }
 
@@ -944,6 +1003,12 @@ function buildCard(
   meta: DesktopMeta | undefined,
   runState: SessionCard["runState"],
   liveOwner: LiveOwner,
+  extra: {
+    status: SessionStatus;
+    process: ProcessDetailsView | null;
+    subSessions: SubSessionRow[];
+    subSessionCount: number;
+  },
 ): SessionCard {
   return {
     sessionId: facts.sessionId,
@@ -961,7 +1026,23 @@ function buildCard(
     messageCount: facts.messageCount,
     command: null,
     warning: null,
+    ...extra,
   };
+}
+
+function statusFor(
+  snapshot: AgentsSnapshot,
+  registry: SessionRegistry,
+  sessionId: string,
+  runState: SessionCard["runState"],
+): SessionStatus {
+  const registryToken = registry.status === "checked" ? (registry.tokens?.[sessionId] ?? null) : null;
+  return resolveStatus({ snapshot, sessionId, runState, registryToken });
+}
+
+function processFor(registry: SessionRegistry, sessionId: string, runState: SessionCard["runState"]): ProcessDetailsView | null {
+  if (runState.kind !== "running" || registry.status !== "checked") return null;
+  return registry.details?.[sessionId] ?? null;
 }
 
 function liveOwnerFor(

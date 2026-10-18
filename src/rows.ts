@@ -1,11 +1,12 @@
 import { channelListenerLive } from "./channel.js";
 import type { Config } from "./config.js";
-import type { LiveOwner } from "./domain.js";
-import { observedRegistryStatus, processIdentity, type ProcessIdentityLookup } from "./registry.js";
+import type { LiveOwner, SessionStatus } from "./domain.js";
+import { processIdentity, type ProcessIdentityLookup } from "./registry.js";
 import { listCmdlines } from "./running.js";
 import { listSessions, type CommandLister } from "./tools.js";
+import type { AgentsLoader } from "./agents.js";
 
-export type Activity = "idle" | "busy" | "unknown";
+export type Activity = "working" | "needs-you" | "idle" | "unknown";
 
 export type DeskRow = {
   sessionId: string;
@@ -15,20 +16,21 @@ export type DeskRow = {
   liveOwner: LiveOwner;
   channelAttached: boolean;
   activity: Activity;
+  status: SessionStatus;
+  subSessionCount: number;
   command: string | null;
   warning: string | null;
 };
 
 const PROBE_MS = 200;
 
-export function activityFromStatus(token: string | null): Activity {
-  switch (token) {
+/** working, needs-you, and idle pass through. Everything else, including not-running, is unknown. */
+export function activityFromStatus(status: SessionStatus): Activity {
+  switch (status.value) {
+    case "working":
+    case "needs-you":
     case "idle":
-      return "idle";
-    case "busy":
-      return "busy";
-    case null:
-      return "unknown";
+      return status.value;
     default:
       return "unknown";
   }
@@ -39,11 +41,11 @@ export async function listRows(
   input: { project?: string; limit?: number },
   lister: CommandLister = listCmdlines,
   identity: ProcessIdentityLookup = processIdentity,
+  agents?: AgentsLoader,
 ): Promise<DeskRow[]> {
-  const listed = await listSessions(config, input, lister, identity);
+  const listed = await listSessions(config, input, lister, identity, agents);
   const rows: DeskRow[] = [];
   for (const card of listed.sessions) {
-    const token = await observedRegistryStatus(config.configRoot, config.home, card.sessionId);
     const channelAttached = await channelListenerLive(config.home, card.sessionId, PROBE_MS);
     rows.push({
       sessionId: card.sessionId,
@@ -52,7 +54,9 @@ export async function listRows(
       cwd: card.cwd,
       liveOwner: card.liveOwner,
       channelAttached,
-      activity: activityFromStatus(token),
+      activity: activityFromStatus(card.status),
+      status: card.status,
+      subSessionCount: card.subSessionCount,
       command: card.command,
       warning: card.warning,
     });

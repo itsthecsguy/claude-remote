@@ -17,6 +17,8 @@ export type Config = {
   home: string;
   platform: NodeJS.Platform;
   osascriptBin: string;
+  agentsJson: boolean;
+  allowDeliver: boolean;
 };
 
 const PLATFORMS = new Set<NodeJS.Platform>([
@@ -80,6 +82,8 @@ export function parseConfig(
     osascriptBin: env.CLAUDE_REMOTE_OSASCRIPT_BIN && env.CLAUDE_REMOTE_OSASCRIPT_BIN.length > 0
       ? env.CLAUDE_REMOTE_OSASCRIPT_BIN
       : "osascript",
+    agentsJson: env.CLAUDE_REMOTE_AGENTS_JSON !== "0",
+    allowDeliver: env.CLAUDE_REMOTE_ALLOW_DELIVER === "1",
   };
 }
 

@@ -14,6 +14,7 @@ export type LaunchRecord = {
 } & (
   | { kind: "tmux"; tmuxTarget: string }
   | { kind: "terminal-app"; tmuxTarget: null }
+  | { kind: "headless"; tmuxTarget: null }
 );
 
 export function launchesRoot(home: string): string {
@@ -118,6 +119,17 @@ function parseLaunch(text: string): LaunchRecord | null {
       recordId: record.recordId,
       kind: "tmux",
       tmuxTarget: record.tmuxTarget,
+      cwd: record.cwd,
+      startedAt: record.startedAt,
+      sessionId,
+      claudePid,
+    };
+  }
+  if (record.kind === "headless" && record.tmuxTarget == null) {
+    return {
+      recordId: record.recordId,
+      kind: "headless",
+      tmuxTarget: null,
       cwd: record.cwd,
       startedAt: record.startedAt,
       sessionId,

@@ -89,6 +89,10 @@ if (args[0] === "send-keys" || args[0] === "kill-session") {
   process.exit(0);
 }
 
+if (args[0] === "set-option") {
+  process.exit(0);
+}
+
 if (args[0] === "has-session") {
   const sessions = await load();
   const session = sessions[flag("-t")];

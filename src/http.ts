@@ -12,6 +12,7 @@ import {
 } from "@modelcontextprotocol/server";
 import type { Config } from "./config.js";
 import { DeskError } from "./domain.js";
+import { registerDeliverTool } from "./deliver.js";
 import { registerLaunchTools } from "./launch.js";
 import { logEvent } from "./log.js";
 import { bearerMatches, readToken } from "./token.js";
@@ -154,6 +155,7 @@ function deskFactory(config: Config): () => McpServer {
     const server = new McpServer({ name: "claude-remote", version: "0.1.0" });
     registerTools(server, config);
     registerLaunchTools(server, config);
+    registerDeliverTool(server, config);
     return server;
   };
 }

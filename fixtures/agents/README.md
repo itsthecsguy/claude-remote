@@ -1,0 +1,1 @@
+`agents.json` has the shape `claude agents --json --all` printed on Claude Code 2.1.302: interactive rows carry pid, cwd, kind, startedAt, sessionId, name, and status; background rows add id and state, and waitingFor appears while status is waiting or state is blocked. Every id, path, and name here is made up.

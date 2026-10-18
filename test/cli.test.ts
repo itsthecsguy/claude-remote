@@ -213,7 +213,7 @@ test("send prints handed while busy, sent when idle, and keeps the message out o
     assert.equal(handed.code, 0, handed.stderr);
     const body = JSON.parse(handed.stdout) as { disposition: string; observedStatus: string; attachmentCount: number };
     assert.equal(body.disposition, "handed");
-    assert.equal(body.observedStatus, "busy");
+    assert.equal(body.observedStatus, "working");
     assert.equal(body.attachmentCount, 0);
     assert.equal(handed.stdout.includes(SECRET), false);
     assert.equal(handed.stderr.includes(SECRET), false);

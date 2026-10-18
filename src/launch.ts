@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -21,6 +21,19 @@ import {
 } from "./launches.js";
 import { processIdentity, sessionRecordForPid, type ProcessIdentityLookup } from "./registry.js";
 import { listCmdlines } from "./running.js";
+import { FORBIDDEN_FLAGS } from "./followup.js";
+import {
+  assertNoBypass,
+  cloudArgs,
+  initFromLine,
+  launchMode,
+  localLaunchFlags,
+  parseCloudJson,
+  parseCloudPane,
+  parseLaunchOptions,
+  type InitFacts,
+  type LaunchOptions,
+} from "./launch-options.js";
 import { prepareProject, type PreparedProject } from "./prepare.js";
 import {
   appleScriptDo,
@@ -44,12 +57,25 @@ export type LaunchIo = {
   openTerminal?: (script: string) => Promise<void>;
 };
 
+export type FastModeReport = {
+  requested: boolean;
+  /** fast_mode_state from the stream-json init event. null when no init event was read. */
+  state: "on" | "off" | "cooldown" | null;
+  disabledReason: string | null;
+  source: "init-event" | "no-init-event" | "not-requested";
+};
+
 export type StartResult = {
   sessionId: string | null;
   tmuxTarget: string | null;
-  kind: "tmux" | "terminal-app";
+  kind: "tmux" | "terminal-app" | "headless" | "cloud";
   recordId: string;
   prepared: string[] | null;
+  worktree?: true | string | null;
+  fastMode?: FastModeReport;
+  claudePid?: number | null;
+  cloudSessionId?: string | null;
+  cloudUrl?: string | null;
 };
 
 export class BlockedByDialog extends DeskError {
@@ -61,12 +87,17 @@ export class BlockedByDialog extends DeskError {
   }
 }
 
+export const WORKTREE_TRUST_HINT =
+  "--worktree exits when the folder has not been trusted yet; open claude there once and accept the trust dialog";
+
 export class UnobservedLaunch extends DeskError {
   readonly tmuxTarget: string;
   readonly recordId: string;
 
-  constructor(tmuxTarget: string, recordId: string) {
-    super("session-unobserved", "the new process did not publish a session id");
+  constructor(tmuxTarget: string, recordId: string, hint?: string) {
+    super("session-unobserved", hint
+      ? `the new process did not publish a session id (${hint})`
+      : "the new process did not publish a session id");
     this.tmuxTarget = tmuxTarget;
     this.recordId = recordId;
   }
@@ -78,6 +109,7 @@ type LaunchRequest = {
   tmuxName?: string;
   acceptDevChannelPrompt: boolean;
   prepare: boolean;
+  launchFlags?: string[];
 };
 
 type LaunchFiles = {
@@ -88,18 +120,48 @@ type LaunchFiles = {
 
 export async function startNew(
   config: Config,
-  input: { folder: string; tmuxName?: string; acceptDevChannelPrompt: boolean; prepare?: boolean },
+  input: {
+    folder: string;
+    tmuxName?: string;
+    acceptDevChannelPrompt: boolean;
+    prepare?: boolean;
+    options?: Partial<Record<keyof LaunchOptions, unknown>>;
+  },
   io?: LaunchIo,
 ): Promise<StartResult> {
   requireLaunch(config);
+  const options = parseLaunchOptions(input.options ?? {});
   const folder = await existingDirectory(input.folder);
-  return startInFolder(config, {
-    cwd: folder,
-    sessionId: null,
-    tmuxName: input.tmuxName,
-    acceptDevChannelPrompt: input.acceptDevChannelPrompt,
-    prepare: input.prepare === true,
-  }, io);
+  const mode = launchMode(options);
+  switch (mode) {
+    case "environment":
+      return startEnvironment(config, folder, options);
+    case "cloud":
+      return startCloud(config, folder, options, input.tmuxName, io);
+    case "headless":
+      return startHeadless(config, folder, options, input.prepare === true);
+    case "interactive": {
+      const started = await startInFolder(config, {
+        cwd: folder,
+        sessionId: null,
+        tmuxName: input.tmuxName,
+        acceptDevChannelPrompt: input.acceptDevChannelPrompt,
+        prepare: input.prepare === true,
+        launchFlags: localLaunchFlags(options),
+      }, io);
+      return {
+        ...started,
+        worktree: options.worktree,
+        fastMode: options.fastMode
+          ? { requested: true, state: null, disabledReason: null, source: "no-init-event" }
+          : { requested: false, state: null, disabledReason: null, source: "not-requested" },
+      };
+    }
+    default: {
+      const _never: never = mode;
+      return assertNever(_never);
+    }
+  }
 }
 
 export async function startContinue(
@@ -135,12 +197,17 @@ export async function stopLaunched(
   const matches = records.filter((record) => matchesStop(record, input));
   if (matches.length === 0) throw new DeskError("not-ours", "no recorded launch matches");
   const tmuxMatches = matches.filter((record) => record.kind === "tmux");
-  if (tmuxMatches.length === 0) {
+  const headlessMatches = matches.filter((record) => record.kind === "headless");
+  if (tmuxMatches.length === 0 && headlessMatches.length === 0) {
     throw new DeskError("manual-window", "close the Terminal window from this launch by hand");
   }
   let stopped: "exited" | "already" | "killed" = "already";
   for (const record of tmuxMatches) {
     stopped = await stopTmux(config, record, io);
+  }
+  for (const record of headlessMatches) {
+    const result = await stopHeadless(config, record);
+    if (result !== "already") stopped = result;
   }
   return { stopped };
 }
@@ -186,7 +253,7 @@ async function startInFolder(
   const target = await pickTarget(run, config.tmuxBin, request.tmuxName);
   if (confirmClear) await confirmClear();
   const files = await launchFiles(config, request);
-  const args = terminalArgs(config.claudeBin, request.sessionId, files);
+  const args = terminalArgs(config.claudeBin, request.sessionId, files, request.launchFlags ?? []);
   const created = await tmuxCode(run, config.tmuxBin, [
     "new-session", "-d", "-s", target, "-c", request.cwd, "--", ...args,
   ]);
@@ -211,7 +278,8 @@ async function startInFolder(
   });
   if (!found.sessionId) {
     if (found.dialog) throw new BlockedByDialog(found.dialog);
-    throw new UnobservedLaunch(target, recordId);
+    const worktree = (request.launchFlags ?? []).includes("--worktree");
+    throw new UnobservedLaunch(target, recordId, worktree ? WORKTREE_TRUST_HINT : undefined);
   }
   return {
     sessionId: found.sessionId,
@@ -225,7 +293,7 @@ async function startInFolder(
 async function openMacTerminal(config: Config, request: LaunchRequest, io?: LaunchIo): Promise<StartResult> {
   const started = Date.now();
   const files = await launchFiles(config, request);
-  const line = shellLine(request.cwd, terminalArgs(config.claudeBin, request.sessionId, files));
+  const line = shellLine(request.cwd, terminalArgs(config.claudeBin, request.sessionId, files, request.launchFlags ?? []));
   const open = io?.openTerminal ?? ((script) => defaultOpenTerminal(config, script));
   await open(appleScriptDo(line));
   const recordId = freshRecordId();
@@ -258,6 +326,220 @@ async function launchFiles(config: Config, request: LaunchRequest): Promise<Laun
   const prepared = request.prepare ? await prepareProject(request.cwd, config.home, addDir) : null;
   const mcpConfig = await writeChannelMcpConfig(config.home);
   return { addDir, mcpConfig, prepared };
+}
+
+/** Children of headless launches this process started, so stop can signal the exact child. */
+const HEADLESS_CHILDREN = new Map<string, ChildProcess>();
+
+/**
+ * Start `claude -p --output-format stream-json --verbose` with the prompt on stdin, read lines
+ * until the system/init event, and return its session id and fast_mode_state. The child keeps
+ * running detached. Its output is drained and dropped, never logged.
+ */
+async function startHeadless(config: Config, cwd: string, options: LaunchOptions, prepare: boolean): Promise<StartResult> {
+  const started = Date.now();
+  const files = await launchFiles(config, { cwd, sessionId: null, acceptDevChannelPrompt: false, prepare });
+  const args = ["-p", "--output-format", "stream-json", "--verbose", "--add-dir", files.addDir, ...localLaunchFlags(options)];
+  assertNoBypass(args, FORBIDDEN_FLAGS);
+  assertSpawnAllowed(config.claudeBin);
+  const child = spawn(config.claudeBin, args, { cwd, detached: true, stdio: ["pipe", "pipe", "ignore"] });
+  const init = readInit(child, Math.max(config.launchWaitMs, 1000));
+  child.stdin?.end(options.prompt ?? "");
+  const facts = await init;
+  child.unref();
+  (child.stdout as { unref?: () => void } | null)?.unref?.();
+  const recordId = freshRecordId();
+  const pid = child.pid ?? null;
+  if (pid != null && child.exitCode == null) {
+    HEADLESS_CHILDREN.set(recordId, child);
+    child.once("exit", () => {
+      HEADLESS_CHILDREN.delete(recordId);
+      void removeLaunch(config.home, recordId);
+    });
+  }
+  await writeLaunch(config.home, {
+    recordId,
+    kind: "headless",
+    tmuxTarget: null,
+    cwd,
+    startedAt: new Date(started).toISOString(),
+    sessionId: facts?.sessionId ?? null,
+    claudePid: pid,
+  });
+  logEvent({
+    tool: "new",
+    sessionId: facts?.sessionId ?? undefined,
+    durationMs: Date.now() - started,
+    code: facts ? "headless-init" : "headless-no-init",
+  });
+  return {
+    sessionId: facts?.sessionId ?? null,
+    tmuxTarget: null,
+    kind: "headless",
+    recordId,
+    prepared: files.prepared?.keys ?? null,
+    worktree: options.worktree,
+    claudePid: pid,
+    fastMode: {
+      requested: options.fastMode,
+      state: facts?.fastModeState ?? null,
+      disabledReason: facts?.fastModeDisabledReason ?? null,
+      source: facts ? "init-event" : "no-init-event",
+    },
+  };
+}
+
+/** Resolve with the init facts, or null at the deadline or exit. Every line after init is dropped. */
+function readInit(child: ChildProcess, timeoutMs: number): Promise<InitFacts | null> {
+  return new Promise<InitFacts | null>((resolve) => {
+    let buffer = "";
+    let settled = false;
+    const finish = (value: InitFacts | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      buffer = "";
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      buffer += chunk.toString("utf8");
+      if (buffer.length > 1_000_000) {
+        finish(null);
+        return;
+      }
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        const facts = initFromLine(line);
+        if (facts) {
+          finish(facts);
+          return;
+        }
+        newline = buffer.indexOf("\n");
+      }
+    });
+    child.once("error", () => finish(null));
+    child.once("exit", () => finish(null));
+  });
+}
+
+async function stopHeadless(
+  config: Config,
+  record: Extract<LaunchRecord, { kind: "headless" }>,
+): Promise<"exited" | "already" | "killed"> {
+  const child = HEADLESS_CHILDREN.get(record.recordId);
+  if (child && child.exitCode == null && child.signalCode == null) {
+    child.kill("SIGTERM");
+    await removeLaunch(config.home, record.recordId);
+    logEvent({ tool: "stop", sessionId: record.sessionId ?? undefined, code: "stopped" });
+    return "killed";
+  }
+  const pid = record.claudePid;
+  // Without the child handle, signal the pid only while its sessions file still names this session.
+  if (pid != null && record.sessionId) {
+    const found = await sessionRecordForPid(config.configRoot, pid, config.home);
+    if (found?.sessionId === record.sessionId) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        // The process has already exited.
+      }
+      await removeLaunch(config.home, record.recordId);
+      logEvent({ tool: "stop", sessionId: record.sessionId, code: "stopped" });
+      return "killed";
+    }
+  }
+  await removeLaunch(config.home, record.recordId);
+  return "already";
+}
+
+/**
+ * `claude --cloud "<desc>"` needs a terminal, so it runs in tmux. remain-on-exit keeps the pane
+ * after the CLI exits so the printed session id can be read back.
+ */
+async function startCloud(
+  config: Config,
+  cwd: string,
+  options: LaunchOptions,
+  tmuxName: string | undefined,
+  io?: LaunchIo,
+): Promise<StartResult> {
+  const started = Date.now();
+  const probe = io?.probeTmux ?? probeTmux;
+  if (!(await probe(config.tmuxBin))) throw new DeskError("tmux-missing", TMUX_INSTALL_HINT);
+  const run = io?.runTmux ?? runTmux;
+  const target = await pickTarget(run, config.tmuxBin, tmuxName);
+  const args = cloudArgs(options);
+  assertNoBypass(args, FORBIDDEN_FLAGS);
+  const created = await tmuxCode(run, config.tmuxBin, ["new-session", "-d", "-s", target, "-c", cwd, "--", config.claudeBin, ...args]);
+  if (created !== 0) throw new DeskError("spawn-failed", "tmux did not start the session");
+  await tmuxCode(run, config.tmuxBin, ["set-option", "-t", target, "remain-on-exit", "on"]);
+  let found: { cloudSessionId: string; url: string | null } | null = null;
+  const deadline = Date.now() + config.launchWaitMs;
+  do {
+    found = parseCloudPane(await tmuxText(run, config.tmuxBin, ["capture-pane", "-t", target, "-p"]));
+    if (found || Date.now() >= deadline) break;
+    await delay(Math.min(200, config.launchWaitMs));
+  } while (Date.now() <= deadline);
+  const recordId = freshRecordId();
+  await writeLaunch(config.home, {
+    recordId,
+    kind: "tmux",
+    tmuxTarget: target,
+    cwd,
+    startedAt: new Date(started).toISOString(),
+    sessionId: null,
+    claudePid: null,
+  });
+  logEvent({ tool: "new", durationMs: Date.now() - started, code: found ? "cloud-created" : "cloud-unobserved" });
+  return {
+    sessionId: null,
+    tmuxTarget: target,
+    kind: "cloud",
+    recordId,
+    prepared: null,
+    cloudSessionId: found?.cloudSessionId ?? null,
+    cloudUrl: found?.url ?? null,
+  };
+}
+
+/** `claude -p "<desc>" --environment ccpool_... --output-format json` creates the session and exits. */
+async function startEnvironment(config: Config, cwd: string, options: LaunchOptions): Promise<StartResult> {
+  const started = Date.now();
+  const args = cloudArgs(options);
+  assertNoBypass(args, FORBIDDEN_FLAGS);
+  assertSpawnAllowed(config.claudeBin);
+  let stdout = "";
+  try {
+    // stdin is closed right away, like `< /dev/null` in the documented example, so -p does not wait on it.
+    const pending = execFileAsync(config.claudeBin, args, {
+      cwd,
+      timeout: Math.min(config.sendTimeoutMs, 55_000),
+      maxBuffer: 1_000_000,
+    });
+    pending.child.stdin?.end();
+    const result = await pending;
+    stdout = String(result.stdout ?? "");
+  } catch (error) {
+    const failed = error as { stdout?: unknown; code?: unknown };
+    if (failed.code === "ENOENT") throw new DeskError("spawn-failed", "claude binary not found");
+    stdout = String(failed.stdout ?? "");
+  }
+  const created = parseCloudJson(stdout);
+  logEvent({ tool: "new", durationMs: Date.now() - started, code: created.ok ? "cloud-created" : created.code });
+  if (!created.ok) throw new DeskError(created.code, "the cloud session was not created");
+  return {
+    sessionId: null,
+    tmuxTarget: null,
+    kind: "cloud",
+    recordId: freshRecordId(),
+    prepared: null,
+    cloudSessionId: created.cloudSessionId,
+    cloudUrl: created.url,
+  };
 }
 
 async function acceptDevPrompt(
@@ -378,17 +660,24 @@ export function assertSpawnAllowed(bin: string): void {
   }
 }
 
+const NEW_SESSION_DESCRIPTION = "Start a session in a folder. Requires the launch gate. With no options it starts an interactive terminal session in tmux. worktree (true, or a name of letters, digits, dot, dash, underscore) adds --worktree. fastMode true adds --settings {\"fastMode\":true}; it is off unless set because fast mode bills extra usage. prompt starts a headless -p session instead and returns the session id and fast_mode_state from its init event; an interactive launch has no init event, so fastMode.state is null there. cloud with a task description runs claude --cloud in tmux and returns the cloud session id once printed. cloud plus environment (a ccpool_ id) runs claude -p <description> --environment <id> --output-format json. cloud does not combine with worktree, fastMode, or prompt. Sends Enter on the development-channels prompt only when acceptDevChannelPrompt is true and the highlighted line is the accept option. Does not answer workspace trust, a new MCP server prompt, or the Chrome extension prompt. No permission-bypass flag is ever passed.";
+
 export function registerLaunchTools(server: McpServer, config: Config): void {
   if (!config.allowLaunch) return;
   server.registerTool(
     "new_session",
     {
-      description: "Start a terminal session in a folder. Requires the launch gate. Sends Enter on the development-channels prompt only when acceptDevChannelPrompt is true and the highlighted line is the accept option. Does not answer workspace trust, a new MCP server prompt, or the Chrome extension prompt.",
+      description: NEW_SESSION_DESCRIPTION,
       inputSchema: z.object({
         folder: z.string().min(1),
         name: z.string().min(1).max(80).optional(),
         acceptDevChannelPrompt: z.boolean().optional(),
         prepare: z.boolean().optional(),
+        worktree: z.union([z.boolean(), z.string().min(1).max(64)]).optional(),
+        fastMode: z.boolean().optional(),
+        cloud: z.string().min(1).max(2000).optional(),
+        environment: z.string().min(8).max(140).optional(),
+        prompt: z.string().min(1).max(100000).optional(),
       }),
     },
     async (args) => {
@@ -398,6 +687,13 @@ export function registerLaunchTools(server: McpServer, config: Config): void {
           tmuxName: args.name,
           acceptDevChannelPrompt: args.acceptDevChannelPrompt === true,
           prepare: args.prepare === true,
+          options: {
+            worktree: args.worktree,
+            fastMode: args.fastMode,
+            cloud: args.cloud,
+            environment: args.environment,
+            prompt: args.prompt,
+          },
         });
         return { content: [{ type: "text", text: JSON.stringify(started) }] };
       } catch (error) {

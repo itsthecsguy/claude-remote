@@ -1,0 +1,8 @@
+[
+  {"pid":41001,"cwd":"/tmp/fixture/demo-app","kind":"interactive","startedAt":1760000000000,"sessionId":"11111111-1111-4111-8111-111111111111","name":"demo-app-3f","status":"busy"},
+  {"pid":41002,"cwd":"/tmp/fixture/sample-app","kind":"interactive","startedAt":1760000001000,"sessionId":"22222222-2222-4222-8222-222222222222","name":"sample-app-9c","status":"waiting","waitingFor":"permission prompt"},
+  {"pid":41003,"cwd":"/tmp/fixture/notes","kind":"interactive","startedAt":1760000002000,"sessionId":"33333333-3333-4333-8333-333333333333","name":"notes-1a","status":"idle"},
+  {"pid":41004,"cwd":"/tmp/fixture/web-ui","kind":"background","startedAt":1760000003000,"id":"bg7k2","sessionId":"44444444-4444-4444-8444-444444444444","name":"web-ui refactor","status":"waiting","state":"blocked","waitingFor":"input needed"},
+  {"cwd":"/tmp/fixture/web-ui","kind":"background","startedAt":1760000004000,"id":"bg9x1","sessionId":"77777777-7777-4777-8777-777777777777","name":"web-ui tests","state":"done"},
+  {"cwd":"/tmp/fixture/web-ui","kind":"background","startedAt":1760000005000,"id":"bg0q3","name":"web-ui lint","state":"failed"}
+]
