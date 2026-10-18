@@ -1,0 +1,40 @@
+{
+  "name": "claude-remote",
+  "version": "0.1.0",
+  "description": "List local coding sessions and resume one through the claude CLI when send is enabled.",
+  "author": "thecsguy <thecsguy@mail.grokbot.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/itsthecsguy/claude-remote.git"
+  },
+  "homepage": "https://github.com/itsthecsguy/claude-remote#readme",
+  "bugs": {
+    "url": "https://github.com/itsthecsguy/claude-remote/issues"
+  },
+  "type": "module",
+  "bin": {
+    "claude-remote": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "export CLAUDE_REMOTE_SPAWN_GUARD=1; tsc -p tsconfig.json --noEmit && NODE_OPTIONS=\"${NODE_OPTIONS:+$NODE_OPTIONS }--require ${PWD}/test/spawn-guard.cjs\" tsx --test --test-concurrency=1 test/*.test.ts",
+    "test:portable": "bash scripts/test-portable.sh",
+    "proof": "tsx scripts/proof.mts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT"
+}

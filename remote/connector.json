@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "claude-remote": {
+      "url": "https://<your-tunnel>.trycloudflare.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}

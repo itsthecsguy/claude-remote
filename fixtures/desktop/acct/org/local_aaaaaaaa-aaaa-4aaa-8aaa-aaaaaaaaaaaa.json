@@ -1,0 +1,10 @@
+{
+  "cliSessionId": "11111111-1111-4111-8111-111111111111",
+  "sessionId": "local_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "title": "Audio desk",
+  "cwd": "/tmp/fixture/demo-app",
+  "branch": "claude/from-desktop-should-not-override",
+  "worktreePath": "/tmp/fixture/demo-app/.claude/worktrees/audio",
+  "worktreeName": "audio",
+  "sourceBranch": "main"
+}

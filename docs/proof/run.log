@@ -1,0 +1,13 @@
+initialize allowSend=0 status=ok server=claude-remote version=0.1.0
+tools/list allowSend=0 status=ok tools=list_sessions,get_session,continue_command,rename_session,cleanup_desk
+initialize allowSend=1 status=ok server=claude-remote version=0.1.0
+tools/list allowSend=1 status=ok tools=list_sessions,get_session,continue_command,rename_session,cleanup_desk,send_followup,queue_status
+list_sessions status=ok scanned=4 page=4 pagedBy=mtime ids=22222222-2222-4222-8222-222222222222,44444444-4444-4444-8444-444444444444,33333333-3333-4333-8333-333333333333,11111111-1111-4111-8111-111111111111
+get_session status=ok session=11111111-1111-4111-8111-111111111111 coverage=full run=finished stuck=null
+send_followup status=ok exit=0 displayedInDesktop=false worktreeLaunch=project session=11111111-1111-4111-8111-111111111111 cwd=/tmp/fixture/demo-app stdinBytes=0 argv=-p --resume 11111111-1111-4111-8111-111111111111 --output-format stream-json --verbose <redacted>
+continue_command status=ok session=11111111-1111-4111-8111-111111111111 liveOwner=none warning=none localId=absent
+server stderr:
+claude-remote {"tool":"list_sessions","durationMs":18}
+claude-remote {"tool":"get_session","sessionId":"11111111-1111-4111-8111-111111111111","durationMs":6,"evidence":"finished"}
+claude-remote {"tool":"send_followup","sessionId":"11111111-1111-4111-8111-111111111111","ticketId":"3948aefc-75c3-4aa8-8994-f2b9ecc0417e","durationMs":49,"exitCode":0}
+claude-remote {"tool":"continue_command","sessionId":"11111111-1111-4111-8111-111111111111","durationMs":6,"evidence":"none"}

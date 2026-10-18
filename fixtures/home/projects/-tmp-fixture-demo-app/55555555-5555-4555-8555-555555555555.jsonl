@@ -1,0 +1,1 @@
+{"type":"user","isSidechain":true,"uuid":"a5555555-5555-4555-8555-555555555501","parentUuid":null,"sessionId":"55555555-5555-4555-8555-555555555555","timestamp":"2024-01-02T00:00:00.000Z","cwd":"/tmp/fixture/demo-app","message":{"role":"user","content":"SIDECHAIN-TITLE"}}
