@@ -30,6 +30,7 @@ export type PendingView = {
   requestId: string;
   sessionId: string;
   agentId: string | null;
+  projectName: string | null;
   kind: PendingKind;
   createdAt: string;
   expiresAt: string | null;
@@ -45,6 +46,9 @@ export type PendingView = {
 export type PermissionAnswer = { behavior: "allow" | "deny"; message?: string };
 export type QuestionAnswer = { answers: Record<string, string> };
 export type HookDecision = { kind: "permission"; answer: PermissionAnswer } | { kind: "question"; answer: QuestionAnswer };
+
+/** An entry was added to or removed from the store. */
+export type PendingChange = { type: "added" | "removed"; view: PendingView };
 
 export type WaitResult =
   | { state: "decided"; decision: HookDecision }
@@ -79,6 +83,7 @@ const CLEAR_MATCH_EVENTS = new Set(["PostToolUse", "PostToolUseFailure", "Permis
 
 export class PendingStore {
   private readonly entries = new Map<string, Entry>();
+  private readonly listeners = new Set<(change: PendingChange) => void>();
 
   constructor(private readonly clock: () => number = Date.now) {}
 
@@ -94,6 +99,7 @@ export class PendingStore {
     const name = typeof event.hook_event_name === "string" ? event.hook_event_name : "";
     if (!sessionId) return none;
     const agentId = safeId(event.agent_id);
+    const projectName = projectNameOf(event.cwd);
     const now = this.clock();
     this.sweep(now);
     if (CLEAR_ALL_EVENTS.has(name)) {
@@ -117,6 +123,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "notification",
         toolName: null,
         notificationType: typeof event.notification_type === "string" ? clip(event.notification_type, 64) : null,
@@ -133,6 +140,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "permission",
         toolName,
         notificationType: null,
@@ -151,6 +159,7 @@ export class PendingStore {
       const requestId = this.add({
         sessionId,
         agentId,
+        projectName,
         kind: "question",
         toolName,
         notificationType: null,
@@ -248,6 +257,24 @@ export class PendingStore {
     return this.entries.size;
   }
 
+  /** Observe entries being added and removed. A throwing listener is ignored. Returns an unsubscribe. */
+  subscribe(listener: (change: PendingChange) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emit(change: PendingChange): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(change);
+      } catch {
+        // a listener must never break hook handling
+      }
+    }
+  }
+
   private answerable(entry: Entry, now: number): boolean {
     return entry.decision === null
       && entry.deadlineMs !== null
@@ -278,6 +305,7 @@ export class PendingStore {
       lastSeenMs: now,
       delivered: false,
     });
+    this.emit({ type: "added", view: { ...this.entries.get(requestId)!.view } });
     while (this.entries.size > MAX_ENTRIES) {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;
@@ -297,6 +325,7 @@ export class PendingStore {
     if (!entry) return;
     this.entries.delete(id);
     for (const waiter of [...entry.waiters]) waiter({ state: "gone" });
+    this.emit({ type: "removed", view: { ...entry.view } });
   }
 
   private sweep(now: number): void {
@@ -312,6 +341,12 @@ export const pendingStore = new PendingStore();
 function safeId(value: unknown): string | null {
   if (typeof value !== "string" || !ID_RE.test(value)) return null;
   return value.toLowerCase();
+}
+
+function projectNameOf(cwd: unknown): string | null {
+  if (typeof cwd !== "string" || cwd.length === 0 || cwd.length > 4096) return null;
+  const name = cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+  return name.length > 0 ? clip(name, 200) : null;
 }
 
 function clip(value: string, max: number): string {

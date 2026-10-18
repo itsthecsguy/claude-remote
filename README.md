@@ -226,6 +226,29 @@ Per the Claude Code hook docs, the terminal runs the `PermissionRequest` hook be
 
 A question can also be answered by sending a normal message (`send_followup` or `deliver_message`) once the question has timed out to the normal prompt.
 
+### Push alerts
+
+The helper can POST a small JSON event to a URL of your choice when a new pending entry appears, so a phone or a webhook-triggered routine hears about a waiting prompt without polling `list_pending`. It is off unless configured.
+
+```bash
+CLAUDE_REMOTE_NOTIFY_SECRET='<16+ characters>' node dist/index.js install --allow-approve --notify-url=https://example.com/hooks/claude
+node dist/index.js install --notify-url=https://example.com/hooks/claude --notify-include-text --notify-cleared
+```
+
+`install` writes the URL and secret to `~/.claude-remote/http/notify.json` (mode `0600`); neither goes in the plist. The secret can also be passed as `--notify-secret=<value>`, but the environment keeps it out of the process list and shell history. Running `install` without `--notify-url` turns alerts off and deletes the file, and `uninstall` deletes it too. A foreground `node dist/index.js http` also reads `CLAUDE_REMOTE_NOTIFY_URL`, `CLAUDE_REMOTE_NOTIFY_SECRET`, `CLAUDE_REMOTE_NOTIFY_AUTH`, `CLAUDE_REMOTE_NOTIFY_INCLUDE_TEXT`, and `CLAUDE_REMOTE_NOTIFY_CLEARED`, which take precedence over the file. The URL must be `https`, or `http` to `127.0.0.1` or `localhost`.
+
+Each new permission request, question, or notification produces exactly one `pending` event. The `permission_prompt` notification Claude Code sends a few seconds after a permission request is not sent again. With `--notify-cleared` the endpoint also gets one `cleared` event when an alerted entry goes away. The body is:
+
+```json
+{"type":"claude-remote.pending","event":"pending","eventId":"<requestId>.pending","requestId":"...","sessionId":"...","projectName":"my-app","kind":"permission","toolName":"Bash","notificationType":null,"createdAt":"...","sentAt":"...","answerable":true}
+```
+
+The question, message, or tool-input text is left out unless `--notify-include-text` (`CLAUDE_REMOTE_NOTIFY_INCLUDE_TEXT=1`) adds `text`, `title`, and `questions`. Pass `requestId` and `sessionId` to `get_session`, `list_pending`, or `answer_permission`.
+
+With a secret, each request carries `X-Claude-Remote-Timestamp` (Unix seconds) and `X-Claude-Remote-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<raw body>" keyed by the secret>`. Check it with a constant-time compare and reject old timestamps. `--notify-auth=bearer` sends `Authorization: Bearer <secret>` instead, for receivers that can only match a static header. `X-Claude-Remote-Delivery` repeats `eventId` for deduplication.
+
+Delivery is fire-and-forget: a 3-second timeout, two retries (after 0.5 and 2 seconds) on a network error, 429, or 5xx, no redirects, and at most 100 queued events. A hook never waits for it. Logs record only `sent`, `failed-<status>`, or `dropped`, never the URL, the secret, or any text.
+
 ## Deliver a message to a live session (experimental)
 
 `deliver_message` puts text in the cross-session inbox of a live session, including a session open in the Desktop app, without resuming it or closing the app. It uses the documented route: a short `claude -p` worker whose only tool is `SendMessage` (`--tools SendMessage --strict-mcp-config --no-session-persistence`) is asked to send the text to `uds:<messagingSocketPath>` from the target's `~/.claude/sessions/<pid>.json`. The text goes to the worker on stdin. The server never writes to the socket itself, because that format is not documented.
