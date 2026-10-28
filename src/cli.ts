@@ -4,10 +4,13 @@ import { DeskError, assertNever } from "./domain.js";
 import { listenHttp, resolveHttpPort, HTTP_HOST } from "./http.js";
 import {
   commandVNode,
+  defaultHooks,
   executeInstall,
   executeStatus,
   executeUninstall,
+  readPort,
   resolveCloudflared,
+  resolveTailscale,
   serverEntry,
   resolveClaudeBin,
   stableNodeBin,
@@ -16,6 +19,8 @@ import {
   type StatusReport,
   type UninstallReport,
 } from "./install.js";
+import { isTunnelMode, readTunnelSettings, tunnelSettingsFrom, type TunnelMode } from "./tunnel.js";
+import { MAX_WATCHDOG_INTERVAL_S, MIN_WATCHDOG_INTERVAL_S, runWatchdog, type WatchdogReport } from "./watchdog.js";
 import { BlockedByDialog, startContinue, startNew, stopLaunched, UnobservedLaunch, type StartResult } from "./launch.js";
 import { pendingFilePath, registryLiveness, startPendingPersistence } from "./pending-file.js";
 import { pendingStore } from "./pending.js";
@@ -25,11 +30,11 @@ import { mintToken, tokenPath, writeToken } from "./token.js";
 import { RENAME_MESSAGE, sendFollowup } from "./tools.js";
 import type { FollowupOutcome } from "./queue.js";
 
-const COMMANDS = ["list", "show", "new", "continue", "send", "rename", "stop", "cleanup", "http", "install", "uninstall", "status", "rotate-token"] as const;
+const COMMANDS = ["list", "show", "new", "continue", "send", "rename", "stop", "cleanup", "http", "install", "uninstall", "status", "rotate-token", "watchdog"] as const;
 
 type CommandName = (typeof COMMANDS)[number];
 
-const USAGE = "usage: claude-remote list|show|new|continue|send|rename|stop|cleanup|http|install|uninstall|status|rotate-token|hook";
+export const USAGE = "usage: claude-remote list|show|new|continue|send|rename|stop|cleanup|http|install|uninstall|status|rotate-token|watchdog|hook";
 
 type Parsed =
   | { command: "list"; json: boolean; project?: string }
@@ -41,12 +46,15 @@ type Parsed =
   | { command: "stop"; json: boolean; sessionId?: string; target?: string }
   | { command: "cleanup"; json: boolean }
   | { command: "http"; port?: number }
-  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags }
+  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags; tunnel: TunnelFlags; watchdog: boolean; watchdogIntervalS?: number }
   | { command: "uninstall"; json: boolean; dryRun: boolean; purge: boolean }
-  | { command: "status"; json: boolean }
-  | { command: "rotate-token"; json: boolean };
+  | { command: "status"; json: boolean; probe: boolean }
+  | { command: "rotate-token"; json: boolean }
+  | { command: "watchdog"; json: boolean };
 
 type NotifyFlags = { url?: string; secret?: string; auth?: string; includeText: boolean; cleared: boolean };
+
+type TunnelFlags = { mode: TunnelMode; name?: string; hostname?: string; credentialsFile?: string; tokenFile?: string };
 
 type Io = {
   stdout: (text: string) => void;
@@ -150,8 +158,14 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
     case "install": {
       const port = resolveHttpPort(env, parsed.port);
       const cloudflared = await resolveCloudflared(env);
+      const tailscale = await resolveTailscale(env);
       const nodeBin = stableNodeBin(process.execPath, await commandVNode(env));
       const report = await executeInstall({
+        tunnel: tunnelSettingsFrom(parsed.tunnel),
+        watchdog: parsed.watchdog,
+        watchdogIntervalS: parsed.watchdogIntervalS,
+        tailscaleBin: tailscale.present ? tailscale.bin : undefined,
+        oauthTokenFile: config.oauthTokenFile,
         home: config.home,
         platform: config.platform,
         uid: process.getuid?.() ?? 0,
@@ -177,6 +191,7 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
       return 0;
     }
     case "uninstall": {
+      const tailscale = await resolveTailscale(env);
       const report = await executeUninstall({
         home: config.home,
         uid: process.getuid?.() ?? 0,
@@ -184,6 +199,7 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         purge: parsed.purge,
         launchctlBin: env.CLAUDE_REMOTE_LAUNCHCTL_BIN || "launchctl",
         claudeBin: config.claudeBin,
+        tailscaleBin: tailscale.present ? tailscale.bin : undefined,
         configRoot: config.configRoot,
       });
       io.stdout(parsed.json ? `${JSON.stringify(report)}\n` : uninstallText(report));
@@ -194,8 +210,22 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         config.home,
         process.getuid?.() ?? 0,
         env.CLAUDE_REMOTE_LAUNCHCTL_BIN || "launchctl",
+        undefined,
+        { probe: parsed.probe && env.CLAUDE_REMOTE_PROBE !== "0" ? undefined : null, oauthTokenFile: config.oauthTokenFile },
       );
       io.stdout(parsed.json ? `${JSON.stringify(report)}\n` : statusText(report));
+      return 0;
+    }
+    case "watchdog": {
+      const report = await runWatchdog({
+        home: config.home,
+        uid: process.getuid?.() ?? 0,
+        port: env.CLAUDE_REMOTE_HTTP_PORT ? resolveHttpPort(env) : await readPort(config.home),
+        launchctlBin: env.CLAUDE_REMOTE_LAUNCHCTL_BIN || "launchctl",
+        settings: await readTunnelSettings(config.home),
+        run: defaultHooks().run,
+      });
+      io.stdout(parsed.json ? `${JSON.stringify(report)}\n` : watchdogText(report));
       return 0;
     }
     case "rotate-token": {
@@ -213,7 +243,7 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
 function parseArgv(argv: string[]): Parsed {
   const command = argv[0];
   if (!command || !isDeskCommand(command)) throw new DeskError("usage", USAGE);
-  if (command === "http" || command === "install" || command === "uninstall" || command === "status" || command === "rotate-token") {
+  if (command === "http" || command === "install" || command === "uninstall" || command === "status" || command === "rotate-token" || command === "watchdog") {
     return parseRemote(command, argv.slice(1));
   }
   const bag = readBag(argv.slice(1));
@@ -377,7 +407,7 @@ function wantsJson(argv: string[]): boolean {
   return argv.includes("--json") || argv.some((arg) => arg.startsWith("--json="));
 }
 
-function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rotate-token", argv: string[]): Parsed {
+function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rotate-token" | "watchdog", argv: string[]): Parsed {
   let json = false;
   let dryRun = false;
   let allowSend = false;
@@ -387,10 +417,18 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
   let hooks = true;
   let purge = false;
   let port: number | undefined;
+  let probe = true;
+  let watchdog = true;
+  let watchdogIntervalS: number | undefined;
   const notify: NotifyFlags = { includeText: false, cleared: false };
+  const tunnel: TunnelFlags = { mode: "quick" };
   for (const token of argv) {
     if (command === "install" && token.startsWith("--notify-")) {
       readNotifyFlag(notify, token);
+      continue;
+    }
+    if (command === "install" && (token.startsWith("--tunnel") || token.startsWith("--hostname="))) {
+      readTunnelFlag(tunnel, token);
       continue;
     }
     if (token === "--json") json = true;
@@ -399,8 +437,11 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     else if (token === "--allow-launch") allowLaunch = true;
     else if (token === "--allow-approve" && command === "install") allowApprove = true;
     else if (token === "--no-hooks" && command === "install") hooks = false;
+    else if (token === "--no-watchdog" && command === "install") watchdog = false;
+    else if (token.startsWith("--watchdog-interval=") && command === "install") watchdogIntervalS = parseWatchdogInterval(token.slice("--watchdog-interval=".length));
     else if (token.startsWith("--approve-timeout=") && command === "install") approveTimeoutS = parseApproveTimeout(token.slice("--approve-timeout=".length));
     else if (token === "--purge") purge = true;
+    else if (token === "--no-probe" && command === "status") probe = false;
     else if (token.startsWith("--port=")) port = parsePort(token.slice("--port=".length));
     else throw new DeskError("usage", USAGE);
   }
@@ -411,14 +452,15 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     case "install":
       if (purge) throw new DeskError("usage", USAGE);
       if (!notify.url && (notify.secret || notify.auth || notify.includeText || notify.cleared)) throw new DeskError("usage", USAGE);
-      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, approveTimeoutS, hooks, port, notify };
+      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, approveTimeoutS, hooks, port, notify, tunnel, watchdog, watchdogIntervalS };
     case "uninstall":
       if (allowSend || allowLaunch || port != null) throw new DeskError("usage", USAGE);
       return { command, json, dryRun, purge };
     case "status":
       if (dryRun || allowSend || allowLaunch || purge || port != null) throw new DeskError("usage", USAGE);
-      return { command, json };
+      return { command, json, probe };
     case "rotate-token":
+    case "watchdog":
       if (dryRun || allowSend || allowLaunch || purge || port != null) throw new DeskError("usage", USAGE);
       return { command, json };
     default: {
@@ -426,6 +468,29 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
       return assertNever(_never);
     }
   }
+}
+
+function readTunnelFlag(tunnel: TunnelFlags, token: string): void {
+  const eq = token.indexOf("=");
+  const flag = eq === -1 ? token : token.slice(0, eq);
+  const value = eq === -1 ? undefined : token.slice(eq + 1);
+  if (!value) throw new DeskError("usage", USAGE);
+  if (flag === "--tunnel") {
+    if (!isTunnelMode(value)) throw new DeskError("usage", "--tunnel must be quick, named, token, funnel, or none");
+    tunnel.mode = value;
+  } else if (flag === "--tunnel-name") tunnel.name = value;
+  else if (flag === "--hostname") tunnel.hostname = value;
+  else if (flag === "--tunnel-credentials") tunnel.credentialsFile = value;
+  else if (flag === "--tunnel-token-file") tunnel.tokenFile = value;
+  else throw new DeskError("usage", USAGE);
+}
+
+function parseWatchdogInterval(raw: string): number {
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < MIN_WATCHDOG_INTERVAL_S || parsed > MAX_WATCHDOG_INTERVAL_S) {
+    throw new DeskError("usage", `--watchdog-interval must be ${MIN_WATCHDOG_INTERVAL_S} to ${MAX_WATCHDOG_INTERVAL_S} seconds`);
+  }
+  return parsed;
 }
 
 function readNotifyFlag(notify: NotifyFlags, token: string): void {
@@ -477,27 +542,58 @@ function installText(report: InstallReport): string {
   return [
     `dryRun=${report.dryRun ? "yes" : "no"}`,
     `tokenPath=${report.tokenPath}`,
+    `tunnelMode=${report.tunnelMode}`,
+    `publicHost=${report.publicHost ?? "-"}`,
     `url=${report.url ?? "-"}`,
     `port=${report.port}`,
     `brew=${report.brew}`,
+    `watchdog=${report.watchdogPlist ? "yes" : "no"}`,
+    `funnelCommand=${report.funnelCommand ?? "-"}`,
+    `oauthTokenPath=${report.oauthTokenPath}`,
+    `oauthTokenFile=${report.oauthTokenFile}`,
     `hookEvents=${report.hookEvents.join(",") || "-"}`,
     `settings=${report.hooks ? report.hooks.settingsPath : "-"}`,
     `settingsChanged=${report.hooks ? (report.hooks.changed ? "yes" : "no") : "-"}`,
     `settingsBackup=${report.hooks?.backupPath ?? "-"}`,
     `notify=${report.notify ? `${report.notify.url} signed=${report.notify.signed ? "yes" : "no"} text=${report.notify.includeText ? "yes" : "no"}` : "-"}`,
     report.httpPlist,
-    report.tunnelPlist,
+    ...(report.tunnelPlist ? [report.tunnelPlist] : []),
+    ...(report.watchdogPlist ? [report.watchdogPlist] : []),
   ].join("\n") + "\n";
 }
 
+/** One line per part, so the first line says what is down and the rest say why. */
 function statusText(report: StatusReport): string {
+  const tunnelProcess = report.tunnelMode === "quick" || report.tunnelMode === "named" || report.tunnelMode === "token";
   return [
-    `helper=${report.helper}`,
-    `tunnel=${report.tunnel}`,
+    `verdict=${report.verdict}`,
+    `helper=${report.helper} pid=${report.helperPid ?? "-"} answers=${report.helperAnswers}${report.helperDetail ? ` detail=${report.helperDetail}` : ""}`,
+    `tunnel=${report.tunnel} mode=${report.tunnelMode}${tunnelProcess ? ` pid=${report.tunnelPid ?? "-"} runs=${report.tunnelRuns ?? "-"} lastExit=${report.tunnelLastExit ?? "-"}` : ""}`,
+    ...(tunnelProcess ? [
+      `tunnelConnected=${report.tunnelConnected} lastRegistered=${report.tunnelLastRegistered ?? "-"} lastRetry=${report.tunnelLastRetry ?? "-"} retries10m=${report.tunnelRetries10m} logBytes=${report.tunnelLogBytes}`,
+    ] : []),
     `url=${report.url ?? "-"}`,
+    `public=${report.publicAnswers}${report.publicDetail ? ` detail=${report.publicDetail}` : ""}`,
     `tokenPath=${report.tokenPath}`,
     `tokenFile=${report.tokenFile}`,
     `port=${report.port}`,
+    `oauthTokenPath=${report.oauthTokenPath}`,
+    `oauthTokenFile=${report.oauthTokenFile} mode=${report.oauthTokenMode ?? "-"} ageDays=${report.oauthTokenAgeDays ?? "-"}`,
+    ...(report.oauthTokenWarning ? [`oauthTokenWarning=${report.oauthTokenWarning}`] : []),
+    `watchdog=${report.watchdog} lastRun=${report.watchdogLastRun ?? "-"} lastVerdict=${report.watchdogLastVerdict ?? "-"} helperRestarts=${report.watchdogHelperRestarts} tunnelRestarts=${report.watchdogTunnelRestarts}`,
+    `checkedAt=${report.checkedAt}`,
+  ].join("\n") + "\n";
+}
+
+function watchdogText(report: WatchdogReport): string {
+  return [
+    `verdict=${report.verdict}`,
+    `helper=${report.helper.state}${report.helperRestarted ? " restarted=yes" : ""}`,
+    `url=${report.url ?? "-"}`,
+    `public=${report.public ? report.public.state + (report.public.detail ? `:${report.public.detail}` : "") : "-"} failures=${report.publicFailures}`,
+    `tunnelRestarted=${report.tunnelRestarted ? "yes" : "no"}${report.skipped ? ` skipped=${report.skipped}` : ""}`,
+    `newUrl=${report.newUrl ?? "-"}`,
+    `trimmed=${report.trimmed.join(",") || "-"}`,
   ].join("\n") + "\n";
 }
 
@@ -505,7 +601,8 @@ function uninstallText(report: UninstallReport): string {
   const hooks = report.hooks && "changed" in report.hooks
     ? `settingsChanged=${report.hooks.changed ? "yes" : "no"}\nsettingsBackup=${report.hooks.backupPath ?? "-"}\n`
     : report.hooks ? `hooksInstalled=${report.hooks.installed ? "yes" : "no"}\n` : "";
-  return `dryRun=${report.dryRun ? "yes" : "no"}\npurge=${report.purge ? "yes" : "no"}\nremoved=${report.removed.join(",")}\n${hooks}`;
+  const funnel = report.funnelCommand ? `funnelCommand=${report.funnelCommand}\n` : "";
+  return `dryRun=${report.dryRun ? "yes" : "no"}\npurge=${report.purge ? "yes" : "no"}\nremoved=${report.removed.join(",")}\n${hooks}${funnel}`;
 }
 
 function listLine(row: DeskRow): string {

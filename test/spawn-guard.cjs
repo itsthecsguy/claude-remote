@@ -2,7 +2,7 @@ const cp = require("node:child_process");
 const path = require("node:path");
 const { promisify } = require("node:util");
 
-const banned = new Set(["osascript", "open", "tmux", "cloudflared", "brew", "launchctl", "claude"]);
+const banned = new Set(["osascript", "open", "tmux", "cloudflared", "brew", "launchctl", "claude", "tailscale", "Tailscale"]);
 
 function refuseTerminalLauncher(command) {
   if (typeof command !== "string") return;
