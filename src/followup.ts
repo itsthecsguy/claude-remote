@@ -178,11 +178,14 @@ export async function spawnClaude(input: {
   timeoutMs: number;
   redact: string;
   onChild?: (pid: number) => Promise<void>;
+  /** The child environment, normally from claudeChildEnv so the setup-token login is available. */
+  env?: NodeJS.ProcessEnv;
 }): Promise<{ result: string; exitCode: number; sessionId: string | null }> {
   const child = spawn(input.bin, input.args, {
     cwd: input.cwd,
     detached: true,
     stdio: ["pipe", "pipe", "pipe"],
+    env: input.env,
   });
   if (!child.stdin || !child.stdout || !child.stderr) {
     throw new DeskError("spawn-failed", "failed to spawn claude");

@@ -47,8 +47,10 @@ for await (const chunk of stdin) chunks.push(chunk);
 const stdinText = Buffer.concat(chunks).toString("utf8");
 const dir = cwd();
 const recordPath = path.join(dir, "fake-claude-record.json");
+// Only whether the long-lived login reached the child is recorded, never the value.
+const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN ? "set" : "unset";
 appendFileSync(path.join(dir, "fake-claude-log.jsonl"), `${JSON.stringify({ pid: process.pid, at: Date.now() })}\n`);
-writeFileSync(recordPath, JSON.stringify({ argv: args, stdin: stdinText, cwd: dir, pid: process.pid, finished: false }));
+writeFileSync(recordPath, JSON.stringify({ argv: args, stdin: stdinText, cwd: dir, pid: process.pid, finished: false, oauth }));
 
 const streaming = args.includes("stream-json");
 const resumeAtStart = args.indexOf("--resume");
@@ -80,7 +82,7 @@ if (Number.isFinite(sleepMs) && sleepMs > 0) {
   });
 }
 
-writeFileSync(recordPath, JSON.stringify({ argv: args, stdin: stdinText, cwd: dir, pid: process.pid, finished: true }));
+writeFileSync(recordPath, JSON.stringify({ argv: args, stdin: stdinText, cwd: dir, pid: process.pid, finished: true, oauth }));
 const resumeAt = args.indexOf("--resume");
 const sessionId = resumeAt >= 0 ? args[resumeAt + 1] ?? "" : "";
 process.stdout.write(`${JSON.stringify({ type: "result", result: "shim-ok", session_id: sessionId })}\n`);

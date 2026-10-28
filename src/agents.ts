@@ -180,14 +180,14 @@ export type AgentsRunner = (bin: string, args: string[], timeoutMs: number) => P
 /**
  * Run `claude agents --json --all`. Any failure (missing binary, older CLI without the
  * subcommand, timeout, bad JSON) returns available=false so callers fall back. stderr is dropped,
- * and nothing from stdout is logged.
+ * and nothing from stdout is logged. `env` is the child environment (see claudeChildEnv).
  */
 export async function loadAgents(
   bin: string,
-  options: { disabled?: boolean; cwd?: string; run?: AgentsRunner } = {},
+  options: { disabled?: boolean; cwd?: string; run?: AgentsRunner; env?: NodeJS.ProcessEnv } = {},
 ): Promise<AgentsSnapshot> {
   if (options.disabled) return { available: false, reason: "disabled" };
-  const run = options.run ?? ((b, a, t) => runAgents(b, a, t, options.cwd));
+  const run = options.run ?? ((b, a, t) => runAgents(b, a, t, options.cwd, options.env));
   let outcome;
   try {
     outcome = await run(bin, ["agents", "--json", "--all"], AGENTS_TIMEOUT_MS);
@@ -202,11 +202,11 @@ export async function loadAgents(
   return snapshotFrom(entries);
 }
 
-function runAgents(bin: string, args: string[], timeoutMs: number, cwd?: string): Promise<{ code: number | null; stdout: string; spawnError: string | null }> {
+function runAgents(bin: string, args: string[], timeoutMs: number, cwd?: string, env?: NodeJS.ProcessEnv): Promise<{ code: number | null; stdout: string; spawnError: string | null }> {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(bin, args, { cwd, stdio: ["ignore", "pipe", "ignore"] });
+      child = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "ignore"] });
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? String(error.code) : "spawn";
       resolve({ code: null, stdout: "", spawnError: code === "ENOENT" ? "ENOENT" : "spawn" });

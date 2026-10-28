@@ -25,6 +25,7 @@ import { loadDesktopIndex, recordedWorkingFolder, resolveDesktopRoot, sessionTit
 import { DESKTOP_NOTICE, followupInvocation, resolveSpawnCwd, skipsFolderProbe, spawnClaude } from "./followup.js";
 import { readLaunches, type LaunchRecord } from "./launches.js";
 import { logEvent, type LogEvent } from "./log.js";
+import { claudeChildEnv } from "./oauth.js";
 import {
   QUEUE_NOTICE,
   STEER_NOTICE,
@@ -79,7 +80,7 @@ export type CommandLister = () => Promise<string[]>;
 const LIST_SUB_ROWS = 20;
 
 export function defaultAgentsLoader(config: Config): AgentsLoader {
-  return () => loadAgents(config.claudeBin, { disabled: !config.agentsJson });
+  return async () => loadAgents(config.claudeBin, { disabled: !config.agentsJson, env: await claudeChildEnv(config) });
 }
 
 const LIST_DESCRIPTION = "List local coding sessions. Each row has the sidebar title when the session is joined, otherwise the transcript title, the project name, cwd as the recorded working folder, run state, status, liveOwner, the continue command, and the live-owner warning. status.value comes from claude agents --json: busy is working, waiting is needs-you with waitingFor, idle is idle, and a background session uses its state (working, blocked as needs-you, done as idle, failed, stopped). A session agents --json does not list is not-running. When that command is missing or fails, status falls back to the sessions/<pid>.json token and status.source says so. process carries entrypoint, tmux, bridgeSessionId, and messagingSocketPath from sessions/<pid>.json while the process is live. subSessions lists subagent transcripts under the session (agentType, isFork, spawnDepth, finished, size, last write) from file stats and .meta.json only, up to 20 per row; subSessionCount is the total. pending lists what the session is waiting on when the claude-remote hooks are installed: the permission request (tool name and input summary), the AskUserQuestion text and options, or the notification message, with a requestId and answerable (see list_pending, answer_permission, answer_question). A session with no transcript yet is included when sessions/<pid>.json names it and that pid is alive with a matching procStart, or when its channel socket accepts a connection. liveOwner is desktop, terminal, none, or unknown. cwd is not the encoded project directory name. The page has no transcript text. A running state with evidence sessions-file means the registry file is live. If the start time cannot be checked, the state is unknown. finished means there is no live marker and the tail is closed. It does not mean the coding task succeeded. Transcript rows are paged by file mtime. Live sessions that have no transcript are added after that page.";
@@ -736,6 +737,7 @@ async function deliverIfAlone(
         timeoutMs: config.sendTimeoutMs,
         redact: message,
         onChild,
+        env: await claudeChildEnv(config),
       });
       return {
         result: spawned.result,

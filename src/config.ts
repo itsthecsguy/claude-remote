@@ -1,7 +1,12 @@
 import os from "node:os";
 import path from "node:path";
+import { oauthTokenPath } from "./oauth.js";
 
 export type Config = {
+  /** The 0600 file holding a `claude setup-token` token for headless claude children. */
+  oauthTokenFile: string;
+  /** Public hostnames the listener also accepts in Host and Origin, for a named tunnel or Funnel. */
+  publicHosts: string[];
   allowSend: boolean;
   allowLaunch: boolean;
   claudeBin: string;
@@ -73,6 +78,8 @@ export function parseConfig(
     ? parsedTimeout
     : DEFAULT_TIMEOUT_MS;
   return {
+    oauthTokenFile: oauthTokenPath(home, env),
+    publicHosts: parsePublicHosts(env.CLAUDE_REMOTE_PUBLIC_HOST),
     allowSend: env.CLAUDE_REMOTE_ALLOW_SEND === "1",
     allowLaunch: env.CLAUDE_REMOTE_ALLOW_LAUNCH === "1",
     claudeBin: env.CLAUDE_REMOTE_CLAUDE_BIN && env.CLAUDE_REMOTE_CLAUDE_BIN.length > 0
@@ -104,6 +111,19 @@ export function parseConfig(
 function platformFromEnv(raw: string | undefined): NodeJS.Platform {
   if (raw && PLATFORMS.has(raw as NodeJS.Platform)) return raw as NodeJS.Platform;
   return process.platform;
+}
+
+const PUBLIC_HOST = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+/** A comma-separated list of DNS names. Anything that is not a plain hostname is dropped. */
+export function parsePublicHosts(raw: string | undefined): string[] {
+  if (!raw) return [];
+  const hosts = new Set<string>();
+  for (const part of raw.split(",")) {
+    const host = part.trim().toLowerCase();
+    if (host.length > 0 && host.length <= 253 && PUBLIC_HOST.test(host)) hosts.add(host);
+  }
+  return [...hosts];
 }
 
 function bounded(raw: string | undefined, fallback: number, hard: number): number {

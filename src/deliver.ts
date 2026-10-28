@@ -5,6 +5,7 @@ import type { Config } from "./config.js";
 import { DeskError } from "./domain.js";
 import { assertSpawnAllowed } from "./launch.js";
 import { logEvent } from "./log.js";
+import { claudeChildEnv } from "./oauth.js";
 import { parseSessionId } from "./paths.js";
 import { loadLiveRecords, processIdentity, type ProcessIdentityLookup } from "./registry.js";
 
@@ -33,6 +34,7 @@ export type WorkerRun = (input: {
   stdin: string;
   cwd: string;
   timeoutMs: number;
+  env?: NodeJS.ProcessEnv;
 }) => Promise<{ code: number | null; stdout: string }>;
 
 const WORKER_TOOLS = "SendMessage";
@@ -147,6 +149,7 @@ export async function deliverMessage(
       stdin: workerPrompt(address, input.message, fence),
       cwd: config.home,
       timeoutMs: Math.min(config.sendTimeoutMs, 50_000),
+      env: await claudeChildEnv(config),
     });
     const judged = judgeWorker(worker.stdout, address, input.message);
     const delivered = judged.code === "delivered" && worker.code === 0;
@@ -178,7 +181,7 @@ function randomFence(): string {
 }
 
 const runWorker: WorkerRun = (input) => new Promise((resolve) => {
-  const child = spawn(input.bin, input.args, { cwd: input.cwd, stdio: ["pipe", "pipe", "ignore"], detached: true });
+  const child = spawn(input.bin, input.args, { cwd: input.cwd, stdio: ["pipe", "pipe", "ignore"], detached: true, env: input.env });
   const chunks: Buffer[] = [];
   let size = 0;
   let settled = false;
