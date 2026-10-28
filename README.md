@@ -55,6 +55,15 @@ node dist/index.js http
 
 The labels are `com.claude-remote.http`, `com.claude-remote.tunnel`, and `com.claude-remote.watchdog`. The plists are under `~/Library/LaunchAgents/` with those names, mode `0600`. The helper and tunnel have `RunAtLoad` and `KeepAlive`; the watchdog has `RunAtLoad` and a `StartInterval`. `--tunnel=funnel` and `--tunnel=none` write no tunnel plist and remove one left by an earlier install.
 
+## Upgrading an existing install
+
+1. In the install directory, pull the new version and build it: `git pull && npm ci && npm run build`.
+2. Optional: give the helper a long-lived login. Run `claude setup-token`, then paste the token into `(umask 077 && mkdir -p ~/.config/claude-remote && cat > ~/.config/claude-remote/oauth-token)` and press Enter, then Ctrl-D. Skip this and you keep the periodic login prompt; see [Long-lived login for headless claude children](#long-lived-login-for-headless-claude-children).
+3. Re-run `install` with the flags you used before, including `--notify-url` (and `CLAUDE_REMOTE_NOTIFY_SECRET` in the environment) if you use alerts. An `install` without `--notify-url` turns alerts off. This adds the watchdog agent and reloads the helper. A quick tunnel keeps its hostname, because its plist does not change.
+4. Optional: add `--tunnel=named --tunnel-name=<name> --hostname=<host>` or `--tunnel=funnel` for a URL that never changes; see [Stable endpoint](#stable-endpoint).
+5. Run `node dist/index.js status` and expect `verdict=ok` and `watchdog=loaded`.
+6. Update the connector URL in the client only if `status` prints a different one. The bearer token does not change.
+
 ## Default port
 
 The default port is `47321`. The listener binds to `127.0.0.1` and rejects any other address. `node dist/index.js http --port=47321` and `node dist/index.js install --port=47321` select another port. `CLAUDE_REMOTE_HTTP_PORT` does the same when the command line does not pass `--port`.

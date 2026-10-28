@@ -59,6 +59,15 @@ I also ran the new `status` from the clone against the live install (read-only, 
 - The log trim assumes both writers opened the log with `O_APPEND` (launchd does; cloudflared's `--logfile` is an append-mode file). If that is wrong for cloudflared, a trimmed log gets a run of NUL bytes at the front, which the parsers skip.
 - The Keychain angle. Nick can check it himself with `claude auth status --text` (prints the login method and expiry), `claude doctor` (reports a Keychain that is not writable), and `security find-generic-password -s "Claude Code-credentials"` without `-w` (metadata only, no secret).
 
+## Upgrading an existing install (short version, also in the README)
+
+1. `git pull && npm ci && npm run build` in the install directory.
+2. Optional: `claude setup-token`, saved to `~/.config/claude-remote/oauth-token` under `umask 077`. Skip it and the periodic login stays.
+3. Re-run `install` with the existing flags, including `--notify-url` again (and the secret in the environment), or alerts turn off.
+4. Optional: `--tunnel=named ...` or `--tunnel=funnel` for a stable URL.
+5. `node dist/index.js status`: expect `verdict=ok` and `watchdog=loaded`.
+6. Update the client URL only if it changed.
+
 ## Rollout (Nick, on the Mac)
 
 The current install has `--allow-send --allow-launch --allow-approve` on and a `notify.json`. `install` turns alerts off unless `--notify-url` is passed again, so step 3 must repeat the notify flags. Read the URL back from `~/.claude-remote/http/notify.json`; the secret is in the same file.
