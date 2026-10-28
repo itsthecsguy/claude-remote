@@ -11,8 +11,12 @@ export type LogEvent = {
   attachmentTypes?: string;
 };
 
+/**
+ * One line per event, with a UTC timestamp first. The helper log had no timestamps, which made
+ * it impossible to line failures up with the tunnel log or with sleep and wake.
+ */
 export function logEvent(event: LogEvent): void {
-  const payload: Record<string, string | number> = { tool: event.tool };
+  const payload: Record<string, string | number> = { at: new Date().toISOString(), tool: event.tool };
   if (event.sessionId) payload.sessionId = event.sessionId;
   if (event.ticketId) payload.ticketId = event.ticketId;
   if (event.durationMs != null) payload.durationMs = event.durationMs;
