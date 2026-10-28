@@ -55,6 +55,12 @@ test("dry-run returns both plists and writes nothing", async () => {
   assert.match(report.tunnelPlist, /127\.0\.0\.1:47321/);
   assert.equal(report.httpPlist.includes("0.0.0.0"), false);
   assert.equal(report.tunnelPlist.includes("0.0.0.0"), false);
+  assert.equal(report.tunnelMode, "quick");
+  assert.equal(report.httpPlist.includes("CLAUDE_REMOTE_PUBLIC_HOST"), false);
+  assert.match(report.watchdogPlist ?? "", /<string>watchdog<\/string>/);
+  assert.match(report.watchdogPlist ?? "", /<key>StartInterval<\/key><integer>120<\/integer>/);
+  assert.match(report.watchdogPlist ?? "", /CLAUDE_REMOTE_HTTP_PORT<\/key><string>47321<\/string>/);
+  assert.equal(report.oauthTokenFile, "missing");
   await assert.rejects(() => stat(tokenPath(home)));
   await assert.rejects(() => stat(httpPlistPath(home)));
 });
@@ -177,6 +183,126 @@ test("status prints the latest tunnel url and not the token", async () => {
   assert.equal(JSON.stringify(status).includes(token), false);
 });
 
+test("status says exactly which part is down", async () => {
+  const { home } = await tempHome();
+  const recorded = recorder();
+  await executeInstall(input(home), recorded.hooks);
+  const log = tunnelLogPath(home);
+  await mkdir(path.dirname(log), { recursive: true });
+  const at = (time: string, message: string): string => `${JSON.stringify({ level: "info", time, message })}\n`;
+  await writeFile(log, at("2026-10-24T04:31:31Z", "|  https://your-tunnel.trycloudflare.com  |") + at("2026-10-24T04:31:32Z", "Registered tunnel connection") + at("2026-10-24T23:14:32Z", "Retrying connection in up to 1m4s"));
+  const now = Date.parse("2026-10-24T23:20:00Z");
+  const launchd = (states: Record<string, string | null>): InstallHooks => ({
+    build: async () => undefined,
+    run: async (_bin, args) => {
+      const label = args[1]?.split("/")[2] ?? "";
+      const state = states[label];
+      return state == null ? { code: 113, stdout: "", stderr: "" } : { code: 0, stdout: `\tstate = running\n\tpid = 4\n\truns = 2\n\tlast exit code = 0\n`, stderr: "" };
+    },
+  });
+  const allUp = launchd({ "com.claude-remote.http": "running", "com.claude-remote.tunnel": "running", "com.claude-remote.watchdog": "running" });
+  const probes = (local: boolean, remote: boolean) => async (url: string) => {
+    const ok = url.startsWith("http://127.0.0.1:") ? local : remote;
+    return ok ? { state: "answers" as const, status: 401, detail: null } : { state: "tunnel-error" as const, status: 530, detail: "http-530" };
+  };
+  const healthy = await executeStatus(home, 501, "/fake/launchctl", allUp, { probe: probes(true, true), now });
+  assert.equal(healthy.verdict, "ok");
+  assert.equal(healthy.url, "https://your-tunnel.trycloudflare.com/mcp");
+  assert.equal(healthy.tunnelConnected, "no");
+  assert.equal(healthy.tunnelRetries10m, 1);
+  assert.equal(healthy.tunnelLastRegistered, "2026-10-24T04:31:32Z");
+  assert.equal(healthy.watchdog, "loaded");
+  assert.equal(healthy.oauthTokenFile, "missing");
+  assert.match(healthy.oauthTokenWarning ?? "", /setup-token/);
+  const deadTunnel = await executeStatus(home, 501, "/fake/launchctl", allUp, { probe: probes(true, false), now });
+  assert.equal(deadTunnel.verdict, "public-not-answering");
+  assert.equal(deadTunnel.publicDetail, "tunnel-error:http-530");
+  const deafHelper = await executeStatus(home, 501, "/fake/launchctl", allUp, { probe: probes(false, true), now });
+  assert.equal(deafHelper.verdict, "helper-not-answering");
+  const noTunnelJob = await executeStatus(home, 501, "/fake/launchctl", launchd({ "com.claude-remote.http": "running" }), { probe: probes(true, true), now });
+  assert.equal(noTunnelJob.verdict, "tunnel-not-loaded");
+  assert.equal(noTunnelJob.watchdog, "missing");
+  const noHelper = await executeStatus(home, 501, "/fake/launchctl", launchd({}), { probe: null, now });
+  assert.equal(noHelper.verdict, "helper-not-loaded");
+  assert.equal(noHelper.helperAnswers, "skipped");
+  await writeFile(log, "");
+  const noUrl = await executeStatus(home, 501, "/fake/launchctl", allUp, { probe: probes(true, true), now });
+  assert.equal(noUrl.verdict, "no-public-url");
+  const tokenFile = path.join(home, "oauth-token");
+  await writeFile(tokenFile, "sk-ant-oat01-0123456789-0123456789-0123456789\n", { mode: 0o600 });
+  const withToken = await executeStatus(home, 501, "/fake/launchctl", allUp, { probe: null, now: Date.now(), oauthTokenFile: tokenFile });
+  assert.equal(withToken.oauthTokenFile, "present");
+  assert.equal(withToken.oauthTokenMode, "0600");
+  assert.equal(withToken.oauthTokenWarning, null);
+  assert.equal(JSON.stringify(withToken).includes("sk-ant-oat01"), false);
+});
+
+test("named, token, funnel, and none modes write what each needs and no more", async () => {
+  const { home } = await tempHome();
+  const launchAgents = path.join(home, "Library", "LaunchAgents");
+  await mkdir(launchAgents, { recursive: true });
+  await chmod(launchAgents, 0o755);
+  const named = recorder();
+  const namedReport = await executeInstall(input(home, {
+    configRoot: path.join(home, "cfg"), now: new Date("2026-10-18T09:01:00Z"),
+    tunnel: { mode: "named", name: "claude-remote", hostname: "remote.example.com", credentialsFile: null },
+  }), named.hooks);
+  assert.equal(namedReport.tunnelMode, "named");
+  assert.equal(namedReport.url, "https://remote.example.com/mcp");
+  assert.equal(namedReport.publicHost, "remote.example.com");
+  assert.match(namedReport.httpPlist, /CLAUDE_REMOTE_PUBLIC_HOST<\/key><string>remote\.example\.com<\/string>/);
+  assert.match(namedReport.tunnelPlist, /<string>--config<\/string><string>[^<]*named\.yml<\/string><string>run<\/string><string>claude-remote<\/string>/);
+  assert.equal(namedReport.tunnelPlist.includes("trycloudflare"), false);
+  assert.match(namedReport.watchdogPlist ?? "", /<key>StartInterval<\/key><integer>120<\/integer>/);
+  assert.equal(namedReport.watchdogPlist?.includes("KeepAlive"), false);
+  assert.match(await readFile(namedReport.namedConfigPath ?? "", "utf8"), /hostname: "remote.example.com"/);
+  assert.equal((await stat(namedReport.namedConfigPath ?? "")).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(await readFile(namedReport.tunnelSettingsPath, "utf8")), { mode: "named", name: "claude-remote", hostname: "remote.example.com", credentialsFile: null });
+  assert.equal(named.calls.filter((line) => line.includes("bootstrap") && line.includes("watchdog")).length, 1);
+  assert.equal(named.calls.some((line) => line.includes("install cloudflared")), false);
+
+  const token = await executeInstall(input(home, {
+    dryRun: true,
+    tunnel: { mode: "token", hostname: "remote.example.com", tokenFile: path.join(home, "tunnel-token") },
+  }), recorder().hooks);
+  assert.match(token.tunnelPlist, /<string>run<\/string><string>--token-file<\/string>/);
+  assert.equal(token.tunnelPlist.includes("--token</string>"), false);
+
+  const funnel = recorder();
+  const funnelReport = await executeInstall(input(home, {
+    configRoot: path.join(home, "cfg"), now: new Date("2026-10-18T09:02:00Z"),
+    tunnel: { mode: "funnel", hostname: "" },
+    tailscaleBin: "/fake/tailscale",
+  }), {
+    build: funnel.hooks.build,
+    run: async (bin, args) => {
+      if (args[0] === "status") return { code: 0, stdout: JSON.stringify({ Self: { DNSName: "mac.tail1234.ts.net." } }), stderr: "" };
+      return funnel.hooks.run(bin, args);
+    },
+  });
+  assert.equal(funnelReport.url, "https://mac.tail1234.ts.net/mcp");
+  assert.equal(funnelReport.tunnelPlist, "");
+  assert.equal(funnelReport.funnelCommand, "/fake/tailscale funnel --bg --https=443 http://127.0.0.1:47321");
+  assert.equal(funnel.calls.some((line) => line === "/fake/tailscale funnel --bg --https=443 http://127.0.0.1:47321"), true);
+  assert.equal(funnel.calls.some((line) => line.includes("bootout") && line.includes("com.claude-remote.tunnel")), true, "the earlier cloudflared job is taken down");
+  await assert.rejects(() => stat(path.join(launchAgents, "com.claude-remote.tunnel.plist")));
+  await assert.rejects(() => stat(namedReport.namedConfigPath ?? ""));
+  assert.match(funnelReport.httpPlist, /CLAUDE_REMOTE_PUBLIC_HOST<\/key><string>mac\.tail1234\.ts\.net<\/string>/);
+  const removed = await executeUninstall({ home, uid: 501, dryRun: false, purge: false, launchctlBin: "/fake/launchctl", claudeBin: "/fake/claude", tailscaleBin: "/fake/tailscale", configRoot: path.join(home, "cfg") }, funnel.hooks);
+  assert.equal(removed.funnelCommand, "/fake/tailscale funnel --bg --https=443 http://127.0.0.1:47321 off");
+  assert.equal(funnel.calls.some((line) => line.endsWith("http://127.0.0.1:47321 off")), true);
+  assert.equal(funnel.calls.some((line) => line.includes("bootout") && line.includes("watchdog")), true);
+
+  const none = await executeInstall(input(home, { configRoot: path.join(home, "cfg"), now: new Date("2026-10-18T09:03:00Z"), tunnel: { mode: "none", hostname: null }, watchdog: false }), recorder().hooks);
+  assert.equal(none.url, null);
+  assert.equal(none.watchdogPlist, null);
+  await assert.rejects(() => stat(none.watchdogPlistPath));
+  await assert.rejects(() => executeInstall(input(home, { tunnel: { mode: "funnel", hostname: "" } }), {
+    build: async () => undefined,
+    run: async () => ({ code: 1, stdout: "", stderr: "" }),
+  }), (error: unknown) => error instanceof DeskError && error.code === "tailscale-missing");
+});
+
 test("the connector draft names the header and is not packaged", async () => {
   const manifest = JSON.parse(await readFile(path.join(repoRoot, "remote", "connector.json"), "utf8")) as {
     mcpServers: { "claude-remote": { url: string; headers: Record<string, string> } };
@@ -237,9 +363,12 @@ test("install and uninstall dry-run use the injected binaries", async () => {
   assert.ok(next);
   assert.notEqual(next, token);
   assert.equal(again.stdout.includes(next), false);
-  const status = await runDesk(home, ["status"], bins);
+  const status = await runDesk(home, ["status", "--no-probe"], bins);
   assert.equal(status.code, 0, status.stderr);
   assert.match(status.stdout, /tokenFile=present/);
+  assert.match(status.stdout, /^verdict=/m);
+  assert.match(status.stdout, /answers=skipped/);
+  assert.match(status.stdout, /oauthTokenFile=missing/);
   assert.match(status.stdout, /tokenPath=/);
   assert.equal(status.stdout.includes(next), false);
   assert.equal(status.stderr.includes(next), false);

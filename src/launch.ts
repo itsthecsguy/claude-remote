@@ -11,6 +11,7 @@ import type { Config } from "./config.js";
 import type { LiveOwner } from "./domain.js";
 import { DeskError, assertNever } from "./domain.js";
 import { logEvent } from "./log.js";
+import { claudeChildEnv } from "./oauth.js";
 import {
   freshRecordId,
   readLaunches,
@@ -342,7 +343,7 @@ async function startHeadless(config: Config, cwd: string, options: LaunchOptions
   const args = ["-p", "--output-format", "stream-json", "--verbose", "--add-dir", files.addDir, ...localLaunchFlags(options)];
   assertNoBypass(args, FORBIDDEN_FLAGS);
   assertSpawnAllowed(config.claudeBin);
-  const child = spawn(config.claudeBin, args, { cwd, detached: true, stdio: ["pipe", "pipe", "ignore"] });
+  const child = spawn(config.claudeBin, args, { cwd, detached: true, stdio: ["pipe", "pipe", "ignore"], env: await claudeChildEnv(config) });
   const init = readInit(child, Math.max(config.launchWaitMs, 1000));
   child.stdin?.end(options.prompt ?? "");
   const facts = await init;
@@ -519,6 +520,7 @@ async function startEnvironment(config: Config, cwd: string, options: LaunchOpti
       cwd,
       timeout: Math.min(config.sendTimeoutMs, 55_000),
       maxBuffer: 1_000_000,
+      env: await claudeChildEnv(config),
     });
     pending.child.stdin?.end();
     const result = await pending;
@@ -651,7 +653,7 @@ async function defaultOpenTerminal(config: Config, script: string): Promise<void
   await execFileAsync(config.osascriptBin, ["-e", script], { timeout: 10000 });
 }
 
-const REAL_BINARIES = new Set(["osascript", "open", "tmux", "cloudflared", "brew", "launchctl", "claude"]);
+const REAL_BINARIES = new Set(["osascript", "open", "tmux", "cloudflared", "brew", "launchctl", "claude", "tailscale", "Tailscale"]);
 
 export function assertSpawnAllowed(bin: string): void {
   if (process.env.CLAUDE_REMOTE_SPAWN_GUARD !== "1") return;

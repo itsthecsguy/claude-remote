@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { runChannelMode } from "./channel-host.js";
-import { isDeskCommand, runCli } from "./cli.js";
+import { isDeskCommand, runCli, USAGE } from "./cli.js";
 import { parseConfig } from "./config.js";
 import { registerDeliverTool } from "./deliver.js";
 import { registerLaunchTools } from "./launch.js";
@@ -27,7 +27,7 @@ if (command && isDeskCommand(command)) {
 }
 
 if (command) {
-  process.stderr.write("usage: claude-remote list|show|new|continue|send|rename|stop|cleanup|http|install|uninstall|status|rotate-token|hook\n");
+  process.stderr.write(`${USAGE}\n`);
   process.exit(2);
 }
 
