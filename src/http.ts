@@ -107,13 +107,15 @@ async function onRequest(
     res.end();
     return;
   }
-  const host = validateHostHeader(hostHeader, localhostAllowedHostnames());
+  // A named tunnel or Funnel can forward its own hostname as Host; install puts that name in
+  // CLAUDE_REMOTE_PUBLIC_HOST. A quick tunnel rewrites Host to 127.0.0.1 and needs nothing here.
+  const host = validateHostHeader(hostHeader, [...localhostAllowedHostnames(), ...config.publicHosts]);
   if (!host.ok) {
     logEvent({ tool: "http", code: "host-rejected" });
     json(res, 403, { error: "forbidden" });
     return;
   }
-  const origin = validateOriginHeader(originHeader, localhostAllowedOrigins());
+  const origin = validateOriginHeader(originHeader, [...localhostAllowedOrigins(), ...config.publicHosts]);
   if (!origin.ok) {
     logEvent({ tool: "http", code: "origin-rejected" });
     json(res, 403, { error: "forbidden" });
