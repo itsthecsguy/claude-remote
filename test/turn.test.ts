@@ -88,7 +88,9 @@ test("get_session reports a tool-heavy turn in progress even when the tail windo
     ["Edit", "/tmp/fixture/turn/src/a.ts", "ok"],
     ["Bash", "npm test", "running"],
   ]);
-  assert.equal(turn.steps[1]?.result, "3 failing");
+  assert.equal(turn.steps[1]?.result, "", "tool-result text stays on the machine unless CLAUDE_REMOTE_STEP_RESULTS=1");
+  const open = await getSession({ ...configAt(home, root), stepResults: true }, { sessionId: id }, async () => [], undefined, NO_AGENTS);
+  assert.equal(open.turn?.steps[1]?.result, "3 failing");
   // No process owns this transcript, so an unfinished turn was interrupted, not still working.
   assert.equal(detail.phase.value, "interrupted");
 });

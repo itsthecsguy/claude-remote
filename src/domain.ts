@@ -1,4 +1,5 @@
 import type { PendingView } from "./pending.js";
+import type { RunRecord } from "./runs.js";
 export type SessionId = string & { readonly __brand: "SessionId" };
 
 export type DesktopSessionId = string & { readonly __brand: "DesktopSessionId" };
@@ -131,6 +132,37 @@ export type SessionDetail = {
   lastReply: string;
   phase: SessionPhase;
   turn: TurnFacts | null;
+  /** The newest claude child this server started for the session, with its final result. */
+  run: RunRecord | null;
+  /** The state of the checkout the session works in, read with git at call time. */
+  git: GitFacts | null;
+};
+
+export type GitFacts = {
+  head: string | null;
+  branch: string | null;
+  upstream: string | null;
+  /** Commits on the branch that its upstream does not have, as of the last fetch or push. */
+  ahead: number | null;
+  behind: number | null;
+  /** Files with uncommitted changes, untracked files included. */
+  dirtyFiles: number;
+  /** true when the branch has an upstream and nothing to push. null without an upstream. */
+  pushed: boolean | null;
+};
+
+/** What wait_session returns: the same facts as get_session without the turn list. */
+export type WaitResult = {
+  sessionId: SessionId;
+  timedOut: boolean;
+  waitedMs: number;
+  phase: SessionPhase;
+  status: SessionStatus;
+  turn: TurnFacts | null;
+  run: RunRecord | null;
+  pending: PendingView[];
+  git: GitFacts | null;
+  next: string;
 };
 
 export type TailEnd =

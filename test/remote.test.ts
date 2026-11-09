@@ -23,7 +23,7 @@ test("hidden methods stay unregistered, and rename does not echo a title", async
   process.env.FAKE_TMUX_DIR = path.join(home, "tmux");
   try {
     const names = await toolNames(listener, token);
-    assert.deepEqual(names, ["list_sessions", "get_session", "continue_command", "rename_session", "cleanup_desk", "list_pending"]);
+    assert.deepEqual(names, ["list_sessions", "get_session", "continue_command", "rename_session", "cleanup_desk", "wait_session", "list_pending"]);
     const renamed = await toolCall(listener, token, "rename_session", { sessionId: ID, title: "SECRET-TITLE" }, 3);
     assert.equal(renamed.isError, true);
     assert.match(renamed.text, /no documented route|does not edit transcript files/);
@@ -52,6 +52,7 @@ test("send still requires confirm, and launch methods appear only behind the gat
       "continue_command",
       "rename_session",
       "cleanup_desk",
+      "wait_session",
       "send_followup",
       "queue_status",
       "new_session",

@@ -36,6 +36,8 @@ export type PendingView = {
   createdAt: string;
   expiresAt: string | null;
   answerable: boolean;
+  /** true once answer_permission or answer_question gave this entry its answer. It stays listed until the session moves on. */
+  answered: boolean;
   toolName: string | null;
   notificationType: string | null;
   title: string | null;
@@ -226,7 +228,7 @@ export class PendingStore {
       throw new DeskError("not-answerable", "no hook is waiting for this request any more; answer it in the app or terminal");
     }
     entry.decision = decision;
-    entry.view = { ...entry.view, answerable: false };
+    entry.view = { ...entry.view, answerable: false, answered: true };
     for (const waiter of [...entry.waiters]) waiter({ state: "decided", decision });
     const until = this.clock() + pickupMs;
     while (!entry.delivered && this.clock() < until) {
@@ -263,7 +265,7 @@ export class PendingStore {
       const view = item.view;
       if (this.entries.has(view.requestId) || !REQUEST_RE.test(view.requestId)) continue;
       this.entries.set(view.requestId, {
-        view: { ...view, answerable: false, expiresAt: null },
+        view: { ...view, answerable: false, answered: view.answered === true, expiresAt: null },
         createdMs: item.createdMs,
         deadlineMs: null,
         matchKey: item.matchKey,
@@ -326,7 +328,7 @@ export class PendingStore {
   }
 
   private add(
-    view: Omit<PendingView, "requestId" | "createdAt" | "expiresAt" | "answerable">,
+    view: Omit<PendingView, "requestId" | "createdAt" | "expiresAt" | "answerable" | "answered">,
     now: number,
     deadlineMs: number | null,
     matchKey: string | null,
@@ -339,6 +341,7 @@ export class PendingStore {
         createdAt: new Date(now).toISOString(),
         expiresAt: deadlineMs === null ? null : new Date(deadlineMs).toISOString(),
         answerable: deadlineMs !== null,
+        answered: false,
       },
       createdMs: now,
       deadlineMs,
@@ -496,7 +499,7 @@ export function attachPending<T extends { sessionId: string; status: { value: st
   return { ...card, pending: store.list({ sessionId: card.sessionId }).slice(0, 10) };
 }
 
-const LIST_PENDING_DESCRIPTION = "List what live sessions are waiting on, as reported by the claude-remote Claude Code hooks: permission requests (tool name and a summary of the tool input), AskUserQuestion questions (question text and options), and notifications (message text and notification_type, such as idle_prompt or permission_prompt). Entries are kept in the helper's memory and in a private file in its state dir, so they survive a helper restart (restored entries are never answerable), and are cleared when the session moves on (the next prompt, tool result, or stop) or stops running. answerable is true while a hook is still waiting for a remote answer; answer it with answer_permission or answer_question when those tools are enabled, otherwise answer in the app or terminal. Empty when the hooks are not installed.";
+const LIST_PENDING_DESCRIPTION = "List what live sessions are waiting on, as reported by the claude-remote Claude Code hooks: permission requests (tool name and a summary of the tool input), AskUserQuestion questions (question text and options), and notifications (message text and notification_type, such as idle_prompt or permission_prompt). Entries are kept in the helper's memory and in a private file in its state dir, so they survive a helper restart (restored entries are never answerable), and are cleared when the session moves on (the next prompt, tool result, or stop) or stops running. answered is true once answer_permission or answer_question has answered the entry; it then stays listed until the session moves on and needs nothing more. answerable is true while a hook is still waiting for a remote answer; answer it with answer_permission or answer_question when those tools are enabled, otherwise answer in the app or terminal. Empty when the hooks are not installed.";
 
 const ANSWER_PERMISSION_DESCRIPTION = "Answer one pending permission request from list_pending. Requires CLAUDE_REMOTE_ALLOW_APPROVE=1 and confirm set to true. decision is allow or deny for this single request only: it never adds a permission rule, never changes the permission mode, and never edits the tool input. Deny and ask rules in the session's settings still apply after an allow. message is passed to Claude with a deny. Fails when no hook is waiting any more (the request timed out to the normal prompt, or was answered locally). The message is not logged.";
 

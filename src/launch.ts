@@ -22,7 +22,7 @@ import {
 } from "./launches.js";
 import { processIdentity, sessionRecordForPid, type ProcessIdentityLookup } from "./registry.js";
 import { listCmdlines } from "./running.js";
-import { FORBIDDEN_FLAGS } from "./followup.js";
+import { EXIT_DRAIN_MS, FORBIDDEN_FLAGS } from "./followup.js";
 import {
   assertNoBypass,
   cloudArgs,
@@ -46,6 +46,7 @@ import {
   TMUX_INSTALL_HINT,
   type BlockingDialog,
 } from "./terminal.js";
+import { resultFromRecord, runStore, StreamReader, type RunResult } from "./runs.js";
 import { continueCommand, type CommandLister } from "./tools.js";
 
 const execFileAsync = promisify(execFile);
@@ -335,7 +336,8 @@ const HEADLESS_CHILDREN = new Map<string, ChildProcess>();
 /**
  * Start `claude -p --output-format stream-json --verbose` with the prompt on stdin, read lines
  * until the system/init event, and return its session id and fast_mode_state. The child keeps
- * running detached. Its output is drained and dropped, never logged.
+ * running detached. Its output is read to the end for one thing only, the final result record,
+ * which goes to the run store with the exit code. Nothing from the stream is logged.
  */
 async function startHeadless(config: Config, cwd: string, options: LaunchOptions, prepare: boolean): Promise<StartResult> {
   const started = Date.now();
@@ -344,9 +346,9 @@ async function startHeadless(config: Config, cwd: string, options: LaunchOptions
   assertNoBypass(args, FORBIDDEN_FLAGS);
   assertSpawnAllowed(config.claudeBin);
   const child = spawn(config.claudeBin, args, { cwd, detached: true, stdio: ["pipe", "pipe", "ignore"], env: await claudeChildEnv(config) });
-  const init = readInit(child, Math.max(config.launchWaitMs, 1000));
+  const stream = watchHeadless(child, Math.max(config.launchWaitMs, 1000));
   child.stdin?.end(options.prompt ?? "");
-  const facts = await init;
+  const facts = await stream.init;
   child.unref();
   (child.stdout as { unref?: () => void } | null)?.unref?.();
   const recordId = freshRecordId();
@@ -357,6 +359,11 @@ async function startHeadless(config: Config, cwd: string, options: LaunchOptions
       HEADLESS_CHILDREN.delete(recordId);
       void removeLaunch(config.home, recordId);
     });
+  }
+  const runSession = facts?.sessionId ?? null;
+  if (runSession) {
+    await runStore.begin(config.home, runSession, "launch");
+    void stream.closed.then((code) => runStore.end(config.home, runSession, code, stream.result()));
   }
   await writeLaunch(config.home, {
     recordId,
@@ -390,41 +397,56 @@ async function startHeadless(config: Config, cwd: string, options: LaunchOptions
   };
 }
 
-/** Resolve with the init facts, or null at the deadline or exit. Every line after init is dropped. */
-function readInit(child: ChildProcess, timeoutMs: number): Promise<InitFacts | null> {
-  return new Promise<InitFacts | null>((resolve) => {
-    let buffer = "";
-    let settled = false;
-    const finish = (value: InitFacts | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      buffer = "";
-      resolve(value);
-    };
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    child.stdout?.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      buffer += chunk.toString("utf8");
-      if (buffer.length > 1_000_000) {
-        finish(null);
-        return;
-      }
-      let newline = buffer.indexOf("\n");
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        const facts = initFromLine(line);
-        if (facts) {
-          finish(facts);
-          return;
-        }
-        newline = buffer.indexOf("\n");
-      }
-    });
-    child.once("error", () => finish(null));
-    child.once("exit", () => finish(null));
+/**
+ * Read the child's stream-json to its end. init resolves with the init facts, or null at the
+ * deadline or exit. closed resolves with the exit code once stdout has ended, so the result
+ * record, which is the last line, has been seen by then.
+ */
+function watchHeadless(child: ChildProcess, timeoutMs: number): {
+  init: Promise<InitFacts | null>;
+  closed: Promise<number | null>;
+  result: () => RunResult | null;
+} {
+  let result: RunResult | null = null;
+  let settled = false;
+  let resolveInit: (value: InitFacts | null) => void = () => undefined;
+  const init = new Promise<InitFacts | null>((resolve) => {
+    resolveInit = resolve;
   });
+  const finish = (value: InitFacts | null): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolveInit(value);
+  };
+  const timer = setTimeout(() => finish(null), timeoutMs);
+  const reader = new StreamReader((record) => {
+    if (!settled) {
+      const facts = initFromLine(JSON.stringify(record));
+      if (facts) finish(facts);
+    }
+    const parsed = resultFromRecord(record);
+    if (parsed) result = parsed;
+  });
+  child.stdout?.on("data", (chunk: Buffer) => reader.feed(chunk));
+  const closed = new Promise<number | null>((resolve) => {
+    child.once("error", () => {
+      finish(null);
+      resolve(null);
+    });
+    child.once("close", (code) => {
+      finish(null);
+      resolve(code);
+    });
+    // A process the child left behind can hold the pipe open past its exit.
+    child.once("exit", (code) => {
+      setTimeout(() => {
+        finish(null);
+        resolve(code);
+      }, EXIT_DRAIN_MS).unref();
+    });
+  });
+  return { init, closed, result: () => result };
 }
 
 async function stopHeadless(

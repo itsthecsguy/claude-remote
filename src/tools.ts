@@ -21,6 +21,10 @@ import { classifyLiveOwner, continueCommandLine, liveWriterWarning } from "./con
 import type { Config } from "./config.js";
 import type { LiveOwner, ProcessDetailsView, SessionCard, SessionDetail, SessionRegistry, SessionStatus, SubSessionRow, TailEnd, WorktreeLaunch } from "./domain.js";
 import { DeskError, assertNever } from "./domain.js";
+import type { GitFacts, TurnFacts, WaitResult } from "./domain.js";
+import { gitFacts } from "./gitfacts.js";
+import { pendingStore } from "./pending.js";
+import { runStore, sessionSignals } from "./runs.js";
 import { loadDesktopIndex, recordedWorkingFolder, resolveDesktopRoot, sessionTitle, type DesktopMeta } from "./desktop.js";
 import { DESKTOP_NOTICE, followupInvocation, resolveSpawnCwd, skipsFolderProbe, spawnClaude } from "./followup.js";
 import { readLaunches, type LaunchRecord } from "./launches.js";
@@ -28,6 +32,7 @@ import { logEvent, type LogEvent } from "./log.js";
 import { claudeChildEnv } from "./oauth.js";
 import {
   QUEUE_NOTICE,
+  STARTED_NOTICE,
   STEER_NOTICE,
   blockReason,
   deliverQueue,
@@ -85,9 +90,9 @@ export function defaultAgentsLoader(config: Config): AgentsLoader {
 
 const LIST_DESCRIPTION = "List local coding sessions. Each row has the sidebar title when the session is joined, otherwise the transcript title, the project name, cwd as the recorded working folder, run state, status, liveOwner, the continue command, and the live-owner warning. status.value comes from claude agents --json: busy is working, waiting is needs-you with waitingFor, idle is idle, and a background session uses its state (working, blocked as needs-you, done as idle, failed, stopped). A session agents --json does not list is not-running. When that command is missing or fails, status falls back to the sessions/<pid>.json token and status.source says so. process carries entrypoint, tmux, bridgeSessionId, and messagingSocketPath from sessions/<pid>.json while the process is live. subSessions lists subagent transcripts under the session (agentType, isFork, spawnDepth, finished, size, last write) from file stats and .meta.json only, up to 20 per row; subSessionCount is the total. pending lists what the session is waiting on when the claude-remote hooks are installed: the permission request (tool name and input summary), the AskUserQuestion text and options, or the notification message, with a requestId and answerable (see list_pending, answer_permission, answer_question). A session with no transcript yet is included when sessions/<pid>.json names it and that pid is alive with a matching procStart, or when its channel socket accepts a connection. liveOwner is desktop, terminal, none, or unknown. cwd is not the encoded project directory name. The page has no transcript text. A running state with evidence sessions-file means the registry file is live. If the start time cannot be checked, the state is unknown. finished means there is no live marker and the tail is closed. It does not mean the coding task succeeded. Transcript rows are paged by file mtime. Live sessions that have no transcript are added after that page.";
 
-const GET_DESCRIPTION = "Read one local coding session. Read phase first: phase.value is working, needs-input (answer card.pending), done (turn.reply is the final answer to turn.prompt), interrupted (the turn stopped with no final reply), failed, stopped, idle, or unknown, and phase.reason says why. turn describes the newest prompt from the whole transcript: prompt, reply (null until the turn has replied), narration (the newest text written between tool calls), toolCalls, toolErrors, openTools, and steps, the newest tool calls with their main argument, outcome (ok, error, running), and the start of each result. lastReply is the newest assistant text in the file and can belong to an earlier turn or to the middle of this one. Also returns recent tail turns and a short extractive summary. card.pending carries the question, permission request, or notification text the hooks reported, as in list_sessions. The stuck line is session is running, a tool error, a tool call with no result, or waiting on a reply. The first match wins.";
+const GET_DESCRIPTION = "Read one local coding session. Read phase first: phase.value is working, needs-input (answer card.pending), done (turn.reply is the final answer to turn.prompt), interrupted (the turn stopped with no final reply), failed, stopped, idle, or unknown, and phase.reason says why. To wait for a change instead of polling, call wait_session. turn describes the newest prompt from the whole transcript: prompt, reply (null until the turn has replied), narration (the newest text written between tool calls), toolCalls, toolErrors, openTools, and steps, the newest tool calls with their main argument, outcome (ok, error, running), and the start of each result. The start of each step result is empty unless the server runs with CLAUDE_REMOTE_STEP_RESULTS=1. run is the newest claude child this server started for the session (new_session with a prompt, or a send_followup that resumed it): its state, exit code, and the final result record with text, isError, numTurns, and permissionDenials. git is the checkout read at call time: branch, head, upstream, ahead, behind, dirtyFiles, and pushed. lastReply is the newest assistant text in the file and can belong to an earlier turn or to the middle of this one. Also returns recent tail turns and a short extractive summary. card.pending carries the question, permission request, or notification text the hooks reported, as in list_sessions. The stuck line is session is running, a tool error, a tool call with no result, or waiting on a reply. The first match wins.";
 
-const SEND_DESCRIPTION = `Send a follow-up for a local coding session. Requires confirm set to true. mode defaults to queue. When no live process owns the session and no channel listener is bound, queue spawns the local claude CLI in the session directory. When a live process owns it, or a channel listener accepts, queue hands the message to that listener and does not resume. With no listener the result is undelivered and nothing is stored for a later resume. A listener that rejects the frame returns rejected and does not resume. steer returns unsupported and does not signal a live process. Optional attachments are inline base64 or a path under ~/.claude-remote/inbox. Copies land in ~/.claude-remote/attachments only when a delivery will actually happen, and the prompt names those paths. File bytes are not logged. Does not pass a permission-bypass flag. ${DESKTOP_NOTICE}`;
+const SEND_DESCRIPTION = `Send a follow-up for a local coding session. Requires confirm set to true. mode defaults to queue. When no live process owns the session and no channel listener is bound, queue spawns the local claude CLI in the session directory and returns sent with the result when that run ends within about 20 seconds; a longer run, or one that stops to ask for a permission or an answer, returns started and keeps going, and wait_session reports what it needs and how it ends. When a live process owns it, or a channel listener accepts, queue hands the message to that listener and does not resume. With no listener the result is undelivered and nothing is stored for a later resume. A listener that rejects the frame returns rejected and does not resume. steer returns unsupported and does not signal a live process. Optional attachments are inline base64 or a path under ~/.claude-remote/inbox. Copies land in ~/.claude-remote/attachments only when a delivery will actually happen, and the prompt names those paths. File bytes are not logged. Does not pass a permission-bypass flag. ${DESKTOP_NOTICE}`;
 
 const QUEUE_DESCRIPTION = "Show follow-up tickets for one session. Tickets do not include the message text. Set deliver to true and confirm to true to resume queued tickets once this server is the only writer. A live process leaves them queued.";
 
@@ -185,8 +190,10 @@ export async function getSession(
         turns: [],
         summary: { did: "", stuck: null, coverage: "full" },
         lastReply: "",
-        phase: phaseOf({ status: bare.status, run: bare.runState, turn: null, pending: bare.pending }),
+        phase: phaseOf({ status: bare.status, run: bare.runState, turn: null, pending: bare.pending, owned: await runStore.get(config.home, id), handoffAt: runStore.handoffAt(id) }),
         turn: null,
+        run: await runStore.get(config.home, id),
+        git: await gitFor(config, bare.cwd),
       };
     }
     const info = await stat(filePath);
@@ -217,13 +224,16 @@ export async function getSession(
       evidence: runStateEvidence(runState),
     });
     const withPending = attachPending(card);
+    const owned = await runStore.get(config.home, id);
     return {
       card: withPending,
       turns: facts.turns,
       summary: summarize(facts, runState, status),
       lastReply: facts.lastReply,
-      phase: phaseOf({ status, run: runState, turn: facts.turn, pending: withPending.pending }),
-      turn: facts.turn,
+      phase: phaseOf({ status, run: runState, turn: facts.turn, pending: withPending.pending, owned, handoffAt: runStore.handoffAt(id) }),
+      turn: stepView(config, facts.turn),
+      run: owned,
+      git: await gitFor(config, withPending.worktreePath ?? withPending.cwd),
     };
   } catch (error) {
     if (error instanceof DeskError) {
@@ -235,7 +245,7 @@ export async function getSession(
 
 export async function sendFollowup(
   config: Config,
-  input: { sessionId: string; message: string; confirm: unknown; mode?: FollowupMode; attachments?: unknown },
+  input: { sessionId: string; message: string; confirm: unknown; mode?: FollowupMode; attachments?: unknown; /** Wait for a resumed run to exit however long it takes, as the CLI does. */ waitForExit?: boolean },
   lister: CommandLister = listCmdlines,
   identity: ProcessIdentityLookup = processIdentity,
 ): Promise<FollowupOutcome> {
@@ -293,7 +303,32 @@ export async function sendFollowup(
       const projectPath = facts.projectPath;
       await resolveSpawnCwd(projectPath, config.home);
       const ticket = await enqueueTicket(config.home, id, message, staged?.ticketId);
-      const outcome = await deliverIfAlone(config, id, projectPath, facts, lister, identity);
+      const delivery = deliverIfAlone(config, id, projectPath, facts, lister, identity);
+      const outcome = input.waitForExit === true ? await delivery : await withinInline(delivery, config.sendInlineMs, id);
+      if (outcome === STILL_RUNNING) {
+        // The resume outlived the inline wait. It keeps running; the run store has its result when it ends.
+        const held = staged;
+        delivery.then(
+          (late) => {
+            const mine = late.blocked ? undefined : late.delivered.find((item) => item.ticketId === ticket.ticketId);
+            logEvent({ tool: "send_followup", sessionId: id, ticketId: ticket.ticketId, durationMs: Date.now() - started, exitCode: mine?.exitCode, code: "late-end" });
+          },
+          async (error: unknown) => {
+            if (held) await removeStaged(config.home, id, held.ticketId).catch(() => undefined);
+            logEvent({ tool: "send_followup", sessionId: id, ticketId: ticket.ticketId, durationMs: Date.now() - started, code: error instanceof DeskError ? error.code : "error" });
+          },
+        );
+        logEvent({ tool: "send_followup", sessionId: id, ticketId: ticket.ticketId, durationMs: Date.now() - started, code: "started", ...attachmentFields(staged) });
+        const begun: FollowupOutcome = {
+          disposition: "started",
+          ticketId: ticket.ticketId,
+          sessionId: id,
+          displayedInDesktop: false,
+          notice: STARTED_NOTICE,
+        };
+        if (staged && staged.views.length > 0 && begun.disposition === "started") begun.attachments = staged.views;
+        return begun;
+      }
       return finishSend(id, ticket.ticketId, outcome, started, staged);
     } catch (error) {
       if (staged) await removeStaged(config.home, id, staged.ticketId);
@@ -438,6 +473,146 @@ export async function queueStatus(
   }
 }
 
+const STILL_RUNNING = Symbol("still-running");
+
+/**
+ * The delivery if it settles within the inline wait, otherwise STILL_RUNNING. A rejection passes
+ * through. A permission request or question from the resumed session ends the wait at once: the
+ * caller is the one who has to answer it, and cannot while this call is still open.
+ */
+function withinInline<T>(delivery: Promise<T>, ms: number, sessionId: string): Promise<T | typeof STILL_RUNNING> {
+  return new Promise((resolve, reject) => {
+    const stop = (): void => {
+      clearTimeout(timer);
+      unsubscribe();
+    };
+    const timer = setTimeout(() => {
+      stop();
+      resolve(STILL_RUNNING);
+    }, ms);
+    const unsubscribe = pendingStore.subscribe((change) => {
+      if (change.type !== "added" || change.view.sessionId !== sessionId || change.view.kind === "notification") return;
+      stop();
+      resolve(STILL_RUNNING);
+    });
+    delivery.then(
+      (value) => {
+        stop();
+        resolve(value);
+      },
+      (error: unknown) => {
+        stop();
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Tool-result text leaves the machine only when CLAUDE_REMOTE_STEP_RESULTS=1. The outcome always does. */
+function stepView(config: Config, turn: TurnFacts | null): TurnFacts | null {
+  if (!turn || config.stepResults) return turn;
+  return { ...turn, steps: turn.steps.map((step) => ({ ...step, result: "" })) };
+}
+
+async function gitFor(config: Config, cwd: string | null): Promise<GitFacts | null> {
+  if (!cwd || skipsFolderProbe(cwd, config.home)) return null;
+  return gitFacts(cwd);
+}
+
+const WAIT_POLL_MS = 2000;
+
+const WAIT_DESCRIPTION = "Block until a session stops working, or until timeoutMs passes (default and maximum 25000; the server caps it below its call deadline). Use it after new_session with a prompt, after send_followup returns started or handed, and after answering a prompt. Returns phase, status, turn (prompt, reply, narration, steps), run (the final result record of a run this server started: text, isError, numTurns, permissionDenials, and the exit code), pending, git (branch, head, ahead, behind, dirtyFiles, pushed), timedOut, and next, which says what to do. timedOut true with phase working means call wait_session again. It returns at once when the session is not working.";
+
+/**
+ * Long-poll one session. It re-reads the session when a hook event, a run exit, or a new prompt
+ * arrives for it, and every two seconds otherwise, and returns as soon as phase is not working.
+ */
+export async function waitSession(
+  config: Config,
+  input: { sessionId: string; timeoutMs?: number },
+  deps: { read?: (sessionId: string) => Promise<SessionDetail>; pollMs?: number; clock?: () => number } = {},
+): Promise<WaitResult> {
+  const clock = deps.clock ?? Date.now;
+  const started = clock();
+  const id = parseSessionId(input.sessionId);
+  if (!id) throw new DeskError("not-uuid", "session id must be a UUID");
+  const read = deps.read ?? ((sessionId: string) => getSession(config, { sessionId }));
+  const budget = Math.max(0, Math.min(input.timeoutMs ?? config.waitMaxMs, config.waitMaxMs));
+  const deadline = started + budget;
+  let woken = false;
+  let wake: (() => void) | null = null;
+  const poke = (sessionId: string): void => {
+    if (sessionId.toLowerCase() !== id) return;
+    woken = true;
+    wake?.();
+  };
+  const stops = [
+    sessionSignals.subscribe((signal) => poke(signal.sessionId)),
+    pendingStore.subscribe((change) => poke(change.view.sessionId)),
+  ];
+  try {
+    for (;;) {
+      woken = false;
+      const detail = await read(id);
+      const now = clock();
+      if (detail.phase.value !== "working" || now >= deadline) {
+        const timedOut = detail.phase.value === "working";
+        logEvent({ tool: "wait_session", sessionId: id, durationMs: now - started, code: timedOut ? "timeout" : detail.phase.value });
+        return {
+          sessionId: id,
+          timedOut,
+          waitedMs: now - started,
+          phase: detail.phase,
+          status: detail.card.status,
+          turn: detail.turn,
+          run: detail.run,
+          pending: detail.card.pending ?? [],
+          git: detail.git,
+          next: nextStep(detail, timedOut),
+        };
+      }
+      if (woken) continue;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, Math.min(deps.pollMs ?? WAIT_POLL_MS, deadline - now));
+        wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      wake = null;
+    }
+  } finally {
+    for (const stop of stops) stop();
+  }
+}
+
+function nextStep(detail: SessionDetail, timedOut: boolean): string {
+  if (timedOut) return "Still working. Call wait_session again.";
+  switch (detail.phase.value) {
+    case "needs-input":
+      return (detail.card.pending ?? []).some((entry) => entry.answerable)
+        ? "Answer pending with answer_permission or answer_question, then call wait_session again."
+        : "The session is waiting for an answer that can only be given in the app or terminal on the machine.";
+    case "done":
+      return detail.run?.result ? "Finished. Read run.result.text, and check git if the task was to commit or push." : "Finished. Read turn.reply, and check git if the task was to commit or push.";
+    case "failed":
+      return "The run ended in an error. Read run.result, when there is one, and turn.steps for the cause.";
+    case "interrupted":
+      return "The turn stopped without a final reply. Read turn.steps for how far it got, then send_followup to continue.";
+    case "stopped":
+      return "The run was stopped. send_followup resumes the session.";
+    case "idle":
+      return "The session is idle with nothing to report. send_followup gives it work.";
+    case "working":
+    case "unknown":
+      return "The state could not be determined. Read phase.reason, then try get_session.";
+    default: {
+      const _never: never = detail.phase.value;
+      return assertNever(_never);
+    }
+  }
+}
+
 export function registerTools(server: McpServer, config: Config): void {
   server.registerTool(
     "list_sessions",
@@ -512,6 +687,24 @@ export function registerTools(server: McpServer, config: Config): void {
       try {
         const cleaned = await cleanupDesk(config);
         return { content: [{ type: "text", text: JSON.stringify(cleaned) }] };
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+  server.registerTool(
+    "wait_session",
+    {
+      description: WAIT_DESCRIPTION,
+      inputSchema: z.object({
+        sessionId: z.string(),
+        timeoutMs: z.number().int().min(0).max(60000).optional(),
+      }),
+    },
+    async (args) => {
+      try {
+        const result = await waitSession(config, args);
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return toolError(error);
       }
@@ -647,6 +840,7 @@ async function offerIfListening(
   const offer = await offerChannel(listenerSocket(config.home, id), message, id, CHANNEL_OFFER_MS);
   if (offer.accepted) {
     const offerId = randomUUID();
+    runStore.noteHandoff(id);
     const observedStatus = await observedSessionStatus(config, id);
     logEvent({
       tool: "send_followup",
@@ -745,16 +939,26 @@ async function deliverIfAlone(
     send: async (message, onChild) => {
       const spawnAt = await resolveSpawnCwd(projectPath, config.home);
       const invocation = followupInvocation(id, message);
-      const spawned = await spawnClaude({
-        bin: config.claudeBin,
-        args: invocation.args,
-        stdin: invocation.stdin,
-        cwd: spawnAt.cwd,
-        timeoutMs: config.sendTimeoutMs,
-        redact: message,
-        onChild,
-        env: await claudeChildEnv(config),
-      });
+      let spawned;
+      try {
+        spawned = await spawnClaude({
+          bin: config.claudeBin,
+          args: invocation.args,
+          stdin: invocation.stdin,
+          cwd: spawnAt.cwd,
+          timeoutMs: config.sendTimeoutMs,
+          redact: message,
+          onChild: async (pid) => {
+            await onChild(pid);
+            await runStore.begin(config.home, id, "followup");
+          },
+          env: await claudeChildEnv(config),
+        });
+      } catch (error) {
+        await runStore.end(config.home, id, null);
+        throw error;
+      }
+      await runStore.end(config.home, id, spawned.exitCode, spawned.run);
       return {
         result: spawned.result,
         exitCode: spawned.exitCode,

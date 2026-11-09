@@ -85,4 +85,29 @@ if (Number.isFinite(sleepMs) && sleepMs > 0) {
 writeFileSync(recordPath, JSON.stringify({ argv: args, stdin: stdinText, cwd: dir, pid: process.pid, finished: true, oauth }));
 const resumeAt = args.indexOf("--resume");
 const sessionId = resumeAt >= 0 ? args[resumeAt + 1] ?? "" : "";
-process.stdout.write(`${JSON.stringify({ type: "result", result: "shim-ok", session_id: sessionId })}\n`);
+// fake-claude-noise-bytes: print that many bytes of stream records before the result, as a long
+// run does. fake-claude-result.json: extra fields for the result record (is_error, num_turns,
+// permission_denials, result). fake-claude-exit-code: the exit status.
+let noise = 0;
+try {
+  noise = Number(readFileSync(path.join(dir, "fake-claude-noise-bytes"), "utf8"));
+} catch {
+  noise = 0;
+}
+const line = `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "n".repeat(8000) }] } })}\n`;
+for (let sent = 0; Number.isFinite(noise) && sent < noise; sent += line.length) {
+  if (!process.stdout.write(line)) await new Promise((resolve) => process.stdout.once("drain", resolve));
+}
+let extra = {};
+try {
+  extra = JSON.parse(readFileSync(path.join(dir, "fake-claude-result.json"), "utf8"));
+} catch {
+  extra = {};
+}
+let code = 0;
+try {
+  code = Number(readFileSync(path.join(dir, "fake-claude-exit-code"), "utf8")) || 0;
+} catch {
+  code = 0;
+}
+process.stdout.write(`${JSON.stringify({ type: "result", result: "shim-ok", session_id: sessionId || initSession, ...extra })}\n`, () => exit(code));

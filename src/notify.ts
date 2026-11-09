@@ -1,3 +1,4 @@
+import type { SessionSignal } from "./runs.js";
 import { createHmac, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
@@ -55,6 +56,18 @@ export type NotifyPayload = {
   text?: string;
   title?: string | null;
   questions?: PendingView["questions"];
+};
+
+export type SessionEventPayload = {
+  type: "claude-remote.session";
+  event: "turn-finished" | "turn-failed" | "run-finished";
+  eventId: string;
+  sessionId: string;
+  projectName: string | null;
+  /** The exit code of a run this server started. null for hook events. */
+  exitCode: number | null;
+  isError: boolean | null;
+  sentAt: string;
 };
 
 export type NotifySend = (url: string, init: { headers: Record<string, string>; body: string; timeoutMs: number }) => Promise<number>;
@@ -227,6 +240,28 @@ export class Notifier {
     private readonly options: { send?: NotifySend; clock?: () => number; retryDelaysMs?: number[]; timeoutMs?: number } = {},
   ) {}
 
+  /**
+   * A turn or a run this server started has ended. One event each, so a webhook-driven reader does
+   * not have to poll for the end of the work. The body has no transcript text.
+   */
+  signal(signal: SessionSignal): void {
+    if (this.closed) return;
+    if (signal.event !== "turn-finished" && signal.event !== "turn-failed" && signal.event !== "run-finished") return;
+    const now = (this.options.clock ?? Date.now)();
+    const sentAt = new Date(now).toISOString();
+    const payload: SessionEventPayload = {
+      type: "claude-remote.session",
+      event: signal.event,
+      eventId: `${signal.sessionId}.${signal.event}.${now}`,
+      sessionId: signal.sessionId,
+      projectName: signal.projectName ?? null,
+      exitCode: signal.event === "run-finished" ? signal.exitCode ?? null : null,
+      isError: signal.event === "run-finished" ? signal.isError ?? null : signal.event === "turn-failed",
+      sentAt,
+    };
+    this.push(JSON.stringify(payload), payload.eventId);
+  }
+
   /** Called synchronously from the store. Only queues work. */
   handle(change: PendingChange): void {
     if (this.closed) return;
@@ -274,7 +309,11 @@ export class Notifier {
   private enqueue(view: PendingView, event: "pending" | "cleared"): void {
     const now = (this.options.clock ?? Date.now)();
     const payload = notifyPayload(view, event, this.settings, now);
-    this.queue.push({ body: JSON.stringify(payload), eventId: payload.eventId, attempt: 0 });
+    this.push(JSON.stringify(payload), payload.eventId);
+  }
+
+  private push(body: string, eventId: string): void {
+    this.queue.push({ body, eventId, attempt: 0 });
     while (this.queue.length > MAX_QUEUE) {
       this.queue.shift();
       logEvent({ tool: "notify", code: "dropped" });

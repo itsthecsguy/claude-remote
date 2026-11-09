@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import path from "node:path";
 import {
   McpServer,
   WebStandardStreamableHTTPServerTransport,
@@ -10,7 +11,9 @@ import {
   validateHostHeader,
   validateOriginHeader,
 } from "@modelcontextprotocol/server";
-import type { Config } from "./config.js";
+import { callTimeoutFrom, type Config } from "./config.js";
+import { parseSessionId } from "./paths.js";
+import { sessionSignals, type SessionSignal } from "./runs.js";
 import { DeskError } from "./domain.js";
 import { registerDeliverTool } from "./deliver.js";
 import { decisionOutput } from "./hook.js";
@@ -60,9 +63,11 @@ export async function listenHttp(config: Config, port = HTTP_PORT, options: { en
   }
   const notify = await loadNotifySettings(options.env ?? process.env, config.home);
   const alerts = notify ? startNotifier(pendingStore, notify) : null;
+  const unsubscribeSignals = alerts ? sessionSignals.subscribe((signal) => alerts.notifier.signal(signal)) : null;
   return {
     port: address.port,
     close: () => new Promise((resolve, reject) => {
+      unsubscribeSignals?.();
       alerts?.stop();
       server.closeAllConnections();
       server.close((error) => error ? reject(error) : resolve());
@@ -80,11 +85,7 @@ export function resolveHttpPort(env: NodeJS.ProcessEnv, explicit?: number): numb
 }
 
 export function callTimeoutMs(env: NodeJS.ProcessEnv): number {
-  const raw = env.CLAUDE_REMOTE_CALL_TIMEOUT_MS;
-  if (!raw) return 30_000;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 200 || parsed > 60_000) return 30_000;
-  return parsed;
+  return callTimeoutFrom(env);
 }
 
 async function onRequest(
@@ -212,6 +213,7 @@ async function onHookRequest(
   if (pathname === HOOK_EVENT_PATH) {
     const result = pendingStore.record(parsed, { allowApprove: config.allowApprove, waitMs: config.approveTimeoutMs });
     const name = parsed && typeof parsed === "object" ? (parsed as { hook_event_name?: unknown }).hook_event_name : null;
+    signalFromHook(parsed);
     logEvent({ tool: "hook", evidence: typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? name : "unknown", code: result.wait ? "wait" : "recorded" });
     if (text) {
       plain(res, result.wait && result.requestId ? `wait ${result.requestId} ${result.waitMs}` : "ok");
@@ -238,6 +240,23 @@ async function onHookRequest(
     return;
   }
   json(res, 200, result);
+}
+
+const HOOK_SIGNALS: Readonly<Record<string, SessionSignal["event"]>> = {
+  Stop: "turn-finished",
+  StopFailure: "turn-failed",
+  SessionEnd: "session-ended",
+};
+
+/** A Stop, StopFailure, or SessionEnd hook ends a wait_session for that session and can be alerted. */
+function signalFromHook(parsed: unknown): void {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+  const event = parsed as { hook_event_name?: unknown; session_id?: unknown; cwd?: unknown; agent_id?: unknown };
+  const mapped = typeof event.hook_event_name === "string" ? HOOK_SIGNALS[event.hook_event_name] : undefined;
+  const sessionId = typeof event.session_id === "string" ? parseSessionId(event.session_id) : null;
+  if (!mapped || !sessionId || typeof event.agent_id === "string") return;
+  const cwd = typeof event.cwd === "string" ? event.cwd : "";
+  sessionSignals.emit({ sessionId, event: mapped, projectName: cwd ? path.basename(cwd).slice(0, 200) || null : null });
 }
 
 function plain(res: ServerResponse, body: string): void {

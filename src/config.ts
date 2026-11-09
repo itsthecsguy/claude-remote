@@ -26,7 +26,32 @@ export type Config = {
   allowDeliver: boolean;
   allowApprove: boolean;
   approveTimeoutMs: number;
+  /** How long send_followup waits for a resumed run before it answers started instead of sent. */
+  sendInlineMs: number;
+  /** The longest one wait_session call may block. Always shorter than the tools/call deadline. */
+  waitMaxMs: number;
+  /** Whether get_session and wait_session include the start of each tool result in turn.steps. */
+  stepResults: boolean;
 };
+
+export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
+
+/** The deadline for one tools/call, from CLAUDE_REMOTE_CALL_TIMEOUT_MS (200 to 60000). */
+export function callTimeoutFrom(env: NodeJS.ProcessEnv): number {
+  const raw = env.CLAUDE_REMOTE_CALL_TIMEOUT_MS;
+  if (!raw) return DEFAULT_CALL_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 200 || parsed > 60_000) return DEFAULT_CALL_TIMEOUT_MS;
+  return parsed;
+}
+
+/** Leave the deadline a margin for reading the session once more and writing the answer. */
+function insideDeadline(env: NodeJS.ProcessEnv, raw: string | undefined, share: number): number {
+  const ceiling = Math.max(0, callTimeoutFrom(env) - 5000);
+  const wanted = raw ? Number(raw) : Number.NaN;
+  if (Number.isFinite(wanted) && wanted >= 0) return Math.min(wanted, ceiling);
+  return Math.floor(ceiling * share);
+}
 
 export const DEFAULT_APPROVE_TIMEOUT_S = 120;
 export const MAX_APPROVE_TIMEOUT_S = 600;
@@ -105,6 +130,9 @@ export function parseConfig(
     allowDeliver: env.CLAUDE_REMOTE_ALLOW_DELIVER === "1",
     allowApprove: env.CLAUDE_REMOTE_ALLOW_APPROVE === "1",
     approveTimeoutMs: approveTimeoutSeconds(env.CLAUDE_REMOTE_APPROVE_TIMEOUT_S) * 1000,
+    sendInlineMs: insideDeadline(env, env.CLAUDE_REMOTE_SEND_INLINE_MS, 0.8),
+    waitMaxMs: insideDeadline(env, env.CLAUDE_REMOTE_WAIT_MAX_MS, 1),
+    stepResults: env.CLAUDE_REMOTE_STEP_RESULTS === "1",
   };
 }
 

@@ -38,6 +38,15 @@ export type FollowupOutcome =
       attachments?: StagedAttachmentView[];
     }
   | {
+      /** The resume is running and outlived the inline wait. wait_session reports how it ends. */
+      disposition: "started";
+      ticketId: string;
+      sessionId: string;
+      displayedInDesktop: false;
+      notice: string;
+      attachments?: StagedAttachmentView[];
+    }
+  | {
       disposition: "queued";
       ticketId: string;
       sessionId: string;
@@ -111,6 +120,9 @@ const MAX_TICKET_BYTES = 200_000;
 
 export const QUEUE_NOTICE =
   "The message is stored as a ticket. This server will not resume it while a live process may still be writing the transcript. It is not injected into the open Code tab. Ask for delivery again only after that process is gone.";
+
+export const STARTED_NOTICE =
+  "The session was resumed with this message and is still working. Nothing is lost by this call returning: call wait_session with the session id until phase is no longer working, then read turn.reply and run.result.";
 
 export const STEER_NOTICE =
   "Steer is not available. No documented interface lets this server interrupt a live Code-tab session without signaling that process. Type the correction in the Code tab, or turn on Remote Control and send from claude.ai/code or the Claude mobile app. Remote Control sends the message through Anthropic servers. This server does not call it.";
