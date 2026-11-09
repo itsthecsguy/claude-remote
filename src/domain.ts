@@ -82,11 +82,55 @@ export type SessionSummary = {
   coverage: SummaryCoverage;
 };
 
+/** One tool call in the current turn, paired with its result by tool_use_id. */
+export type TurnStep = {
+  tool: string;
+  /** The command, file path, pattern, or other main argument, clipped. */
+  input: string;
+  outcome: "ok" | "error" | "running";
+  /** The start of the tool result, clipped. Empty while the call is running. */
+  result: string;
+};
+
+/**
+ * The newest prompt in the transcript and what has happened since, read from the whole file.
+ * state is what the transcript shows on its own: replied when the last record of the turn is an
+ * assistant message with no tool call. explicitEnd says that message carried an end stop_reason.
+ */
+export type TurnFacts = {
+  state: "replied" | "in-progress";
+  explicitEnd: boolean;
+  prompt: string;
+  startedAt: string | null;
+  lastActivity: string | null;
+  /** The final assistant text of this turn. null until the turn has replied. */
+  reply: string | null;
+  replyTruncated: boolean;
+  /** The newest assistant text written between tool calls, clipped. */
+  narration: string | null;
+  toolCalls: number;
+  toolErrors: number;
+  /** Names of tool calls that have no result yet. */
+  openTools: string[];
+  /** The newest tool calls of this turn, oldest first. */
+  steps: TurnStep[];
+};
+
+export type PhaseValue = "working" | "needs-input" | "done" | "interrupted" | "failed" | "stopped" | "idle" | "unknown";
+
+/** One verdict that combines process status, pending prompts, and the transcript turn. */
+export type SessionPhase = {
+  value: PhaseValue;
+  reason: string;
+};
+
 export type SessionDetail = {
   card: SessionCard;
   turns: Turn[];
   summary: SessionSummary;
   lastReply: string;
+  phase: SessionPhase;
+  turn: TurnFacts | null;
 };
 
 export type TailEnd =

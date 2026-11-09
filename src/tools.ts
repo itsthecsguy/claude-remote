@@ -45,7 +45,7 @@ import { discoverTranscripts, parseSessionId, resolveSessionFile } from "./paths
 import { loadLiveRecords, loadSessionRegistry, observedRegistryStatus, processIdentity, type LiveRecord, type ProcessIdentityLookup } from "./registry.js";
 import { readTranscript, type TranscriptFacts } from "./read.js";
 import { classifyRunState, listCmdlines, runStateEvidence, tailFlag } from "./running.js";
-import { summarize } from "./summary.js";
+import { phaseOf, summarize } from "./summary.js";
 import { loadAgents, resolveStatus, statusFromEntry, statusFromToken, type AgentsLoader, type AgentsSnapshot } from "./agents.js";
 import { listSubSessions } from "./subagents.js";
 
@@ -85,7 +85,7 @@ export function defaultAgentsLoader(config: Config): AgentsLoader {
 
 const LIST_DESCRIPTION = "List local coding sessions. Each row has the sidebar title when the session is joined, otherwise the transcript title, the project name, cwd as the recorded working folder, run state, status, liveOwner, the continue command, and the live-owner warning. status.value comes from claude agents --json: busy is working, waiting is needs-you with waitingFor, idle is idle, and a background session uses its state (working, blocked as needs-you, done as idle, failed, stopped). A session agents --json does not list is not-running. When that command is missing or fails, status falls back to the sessions/<pid>.json token and status.source says so. process carries entrypoint, tmux, bridgeSessionId, and messagingSocketPath from sessions/<pid>.json while the process is live. subSessions lists subagent transcripts under the session (agentType, isFork, spawnDepth, finished, size, last write) from file stats and .meta.json only, up to 20 per row; subSessionCount is the total. pending lists what the session is waiting on when the claude-remote hooks are installed: the permission request (tool name and input summary), the AskUserQuestion text and options, or the notification message, with a requestId and answerable (see list_pending, answer_permission, answer_question). A session with no transcript yet is included when sessions/<pid>.json names it and that pid is alive with a matching procStart, or when its channel socket accepts a connection. liveOwner is desktop, terminal, none, or unknown. cwd is not the encoded project directory name. The page has no transcript text. A running state with evidence sessions-file means the registry file is live. If the start time cannot be checked, the state is unknown. finished means there is no live marker and the tail is closed. It does not mean the coding task succeeded. Transcript rows are paged by file mtime. Live sessions that have no transcript are added after that page.";
 
-const GET_DESCRIPTION = "Read one local coding session. Returns recent tail turns and a short extractive summary. card.pending carries the question, permission request, or notification text the hooks reported, as in list_sessions. The stuck line is session is running, a tool error, a tool call with no result, or waiting on a reply. The first match wins.";
+const GET_DESCRIPTION = "Read one local coding session. Read phase first: phase.value is working, needs-input (answer card.pending), done (turn.reply is the final answer to turn.prompt), interrupted (the turn stopped with no final reply), failed, stopped, idle, or unknown, and phase.reason says why. turn describes the newest prompt from the whole transcript: prompt, reply (null until the turn has replied), narration (the newest text written between tool calls), toolCalls, toolErrors, openTools, and steps, the newest tool calls with their main argument, outcome (ok, error, running), and the start of each result. lastReply is the newest assistant text in the file and can belong to an earlier turn or to the middle of this one. Also returns recent tail turns and a short extractive summary. card.pending carries the question, permission request, or notification text the hooks reported, as in list_sessions. The stuck line is session is running, a tool error, a tool call with no result, or waiting on a reply. The first match wins.";
 
 const SEND_DESCRIPTION = `Send a follow-up for a local coding session. Requires confirm set to true. mode defaults to queue. When no live process owns the session and no channel listener is bound, queue spawns the local claude CLI in the session directory. When a live process owns it, or a channel listener accepts, queue hands the message to that listener and does not resume. With no listener the result is undelivered and nothing is stored for a later resume. A listener that rejects the frame returns rejected and does not resume. steer returns unsupported and does not signal a live process. Optional attachments are inline base64 or a path under ~/.claude-remote/inbox. Copies land in ~/.claude-remote/attachments only when a delivery will actually happen, and the prompt names those paths. File bytes are not logged. Does not pass a permission-bypass flag. ${DESKTOP_NOTICE}`;
 
@@ -179,7 +179,15 @@ export async function getSession(
         durationMs: Date.now() - started,
         evidence: runStateEvidence(card.runState),
       });
-      return { card: attachPending(card), turns: [], summary: { did: "", stuck: null, coverage: "full" }, lastReply: "" };
+      const bare = attachPending(card);
+      return {
+        card: bare,
+        turns: [],
+        summary: { did: "", stuck: null, coverage: "full" },
+        lastReply: "",
+        phase: phaseOf({ status: bare.status, run: bare.runState, turn: null, pending: bare.pending }),
+        turn: null,
+      };
     }
     const info = await stat(filePath);
     const facts = await readTranscript(filePath, id, path.basename(path.dirname(filePath)), info.mtimeMs);
@@ -208,7 +216,15 @@ export async function getSession(
       durationMs: Date.now() - started,
       evidence: runStateEvidence(runState),
     });
-    return { card: attachPending(card), turns: facts.turns, summary: summarize(facts, runState, status), lastReply: facts.lastReply };
+    const withPending = attachPending(card);
+    return {
+      card: withPending,
+      turns: facts.turns,
+      summary: summarize(facts, runState, status),
+      lastReply: facts.lastReply,
+      phase: phaseOf({ status, run: runState, turn: facts.turn, pending: withPending.pending }),
+      turn: facts.turn,
+    };
   } catch (error) {
     if (error instanceof DeskError) {
       logEvent({ tool: "get_session", sessionId: safeId, durationMs: Date.now() - started, code: error.code });

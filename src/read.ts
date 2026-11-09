@@ -1,12 +1,18 @@
 import { open, stat } from "node:fs/promises";
 import path from "node:path";
-import type { SessionId, SummaryCoverage, TailEnd, Turn } from "./domain.js";
+import type { SessionId, SummaryCoverage, TailEnd, Turn, TurnFacts, TurnStep } from "./domain.js";
 
 const WINDOW = 65536;
 const MAX_LINE = 1024 * 1024;
 const PREFIX = 200;
 const TURN_TEXT = 500;
 const MAX_TURNS = 20;
+const MAX_STEPS = 15;
+const STEP_TEXT = 200;
+const REPLY_MAX = 8000;
+/** The text Claude Code records when a turn needed no answer. It is never the reply a reader wants. */
+export const FILLER_REPLY = "No response requested.";
+const END_REASONS: ReadonlySet<unknown> = new Set(["end_turn", "stop_sequence", "max_tokens", "refusal"]);
 
 export type TranscriptFacts = {
   sessionId: SessionId;
@@ -22,6 +28,7 @@ export type TranscriptFacts = {
   end: TailEnd;
   incomplete: boolean;
   did: string;
+  turn: TurnFacts | null;
 };
 
 type Raw = Record<string, unknown>;
@@ -42,7 +49,9 @@ export async function readTranscript(
   const branch = lastString(tailRecords, "gitBranch") ?? firstString(head, "gitBranch");
   const title = pickTitle(head, tailRecords);
   const counted = tailRecords.filter(isMessageRecord);
-  const turns = counted.slice(-MAX_TURNS).map(toTurn).filter((turn) => turn.text.length > 0 || turn.toolNames.length > 0);
+  // The turns come from the whole-file scan. A 64 KB tail of a current transcript often holds
+  // two or three message records, because tool results and bookkeeping records fill it.
+  const turns = streamed.turns;
   const end = walkEnd(counted);
   const coverage = parentCoverage(counted);
   const lastActivity = streamed.maxTimestamp ?? new Date(mtimeMs).toISOString();
@@ -59,7 +68,8 @@ export async function readTranscript(
     coverage,
     end,
     incomplete: tail.incomplete,
-    did: didText(counted),
+    did: didText(turns, streamed.turn),
+    turn: streamed.turn,
   };
 }
 
@@ -82,17 +92,16 @@ function firstUserPrompt(records: Raw[]): string | null {
   return null;
 }
 
-function didText(records: Raw[]): string {
+function didText(turns: readonly Turn[], turn: TurnFacts | null): string {
   let last = "";
   const tools: string[] = [];
-  for (const rec of records) {
-    for (const name of toolNamesOf(rec.message)) {
+  for (const item of turns) {
+    for (const name of item.toolNames) {
       if (!tools.includes(name)) tools.push(name);
     }
-    if (rec.type !== "assistant") continue;
-    const text = textOf(rec.message).trim();
-    if (text) last = text.slice(0, TURN_TEXT);
+    if (item.role === "assistant" && item.text.trim() && item.text.trim() !== FILLER_REPLY) last = item.text.trim();
   }
+  if (!last) last = (turn?.reply ?? turn?.narration ?? "").slice(0, TURN_TEXT);
   if (last && tools.length > 0) return `${last} Tools: ${tools.join(", ")}.`;
   if (last) return last;
   if (tools.length > 0) return `Tools: ${tools.join(", ")}.`;
@@ -184,12 +193,16 @@ function toolNamesOf(message: unknown): string[] {
   return names;
 }
 
-function toolResultsOf(message: unknown): { isError: boolean; text: string }[] {
+function toolResultsOf(message: unknown): { isError: boolean; text: string; id: string | null }[] {
   const blocks = blocksOf(message);
-  const results: { isError: boolean; text: string }[] = [];
+  const results: { isError: boolean; text: string; id: string | null }[] = [];
   for (const block of blocks) {
     if (block.type !== "tool_result") continue;
-    results.push({ isError: block.is_error === true, text: blockText(block.content) });
+    results.push({
+      isError: block.is_error === true,
+      text: blockText(block.content),
+      id: typeof block.tool_use_id === "string" ? block.tool_use_id : null,
+    });
   }
   return results;
 }
@@ -249,11 +262,13 @@ function tryParse(line: string): Raw | null {
   }
 }
 
-async function streamFacts(filePath: string): Promise<{ messageCount: number; maxTimestamp: string | null; lastReply: string }> {
+async function streamFacts(filePath: string): Promise<{ messageCount: number; maxTimestamp: string | null; lastReply: string; turns: Turn[]; turn: TurnFacts | null }> {
   let messageCount = 0;
   let lastReply = "";
   let maxTimestamp: string | null = null;
   let maxMs = Number.NEGATIVE_INFINITY;
+  const turns: Turn[] = [];
+  const tracker = new TurnTracker();
   await scanLines(filePath, (line) => {
     if (line.oversized) {
       const flags = flagsFromPrefix(line.text);
@@ -264,12 +279,18 @@ async function streamFacts(filePath: string): Promise<{ messageCount: number; ma
     }
     const rec = tryParse(line.text);
     if (!rec) return;
-    if ((rec.type === "user" || rec.type === "assistant") && rec.isSidechain !== true && rec.isMeta !== true) {
+    if (isMessageRecord(rec)) {
       messageCount += 1;
+      tracker.add(rec);
+      const turn = toTurn(rec);
+      if (turn.text.length > 0 || turn.toolNames.length > 0) {
+        turns.push(turn);
+        if (turns.length > MAX_TURNS) turns.shift();
+      }
     }
     if (rec.type === "assistant" && rec.isSidechain !== true && rec.isMeta !== true) {
       const text = textOf(rec.message).trim();
-      if (text) lastReply = text;
+      if (text && text !== FILLER_REPLY) lastReply = text;
     }
     if (typeof rec.timestamp === "string") {
       const ms = Date.parse(rec.timestamp);
@@ -279,7 +300,154 @@ async function streamFacts(filePath: string): Promise<{ messageCount: number; ma
       }
     }
   });
-  return { messageCount, maxTimestamp, lastReply };
+  return { messageCount, maxTimestamp, lastReply, turns, turn: tracker.finish() };
+}
+
+type Building = {
+  prompt: string;
+  startedAt: string | null;
+  lastActivity: string | null;
+  reply: string | null;
+  explicitEnd: boolean;
+  narration: string | null;
+  toolCalls: number;
+  toolErrors: number;
+  steps: TurnStep[];
+  open: Map<string, TurnStep>;
+  replied: boolean;
+};
+
+/**
+ * Follows the newest prompt through the file: its tool calls paired with their results, the text
+ * written between them, and the final reply. A turn whose whole answer is the filler reply is
+ * dropped in favour of the turn before it, so a notification that needed no answer does not hide
+ * the result of the work.
+ */
+class TurnTracker {
+  private current: Building | null = null;
+  private previous: Building | null = null;
+
+  add(rec: Raw): void {
+    const stamp = typeof rec.timestamp === "string" ? rec.timestamp : null;
+    if (rec.type === "user") {
+      const results = toolResultsOf(rec.message);
+      if (results.length > 0) {
+        const turn = this.ensure(stamp);
+        for (const result of results) {
+          if (result.isError) turn.toolErrors += 1;
+          const step = result.id ? turn.open.get(result.id) : undefined;
+          if (!step) continue;
+          step.outcome = result.isError ? "error" : "ok";
+          step.result = clip(result.text, STEP_TEXT);
+          if (result.id) turn.open.delete(result.id);
+        }
+        turn.replied = false;
+        turn.lastActivity = stamp ?? turn.lastActivity;
+        return;
+      }
+      const text = textOf(rec.message).trim();
+      if (!text) return;
+      if (this.current && !isFiller(this.current)) this.previous = this.current;
+      this.current = blankTurn(text.slice(0, TURN_TEXT), stamp);
+      return;
+    }
+    if (rec.type !== "assistant") return;
+    const message = rec.message as { stop_reason?: unknown } | undefined;
+    const calls = toolCallsOf(rec.message);
+    const text = textOf(rec.message).trim();
+    if (calls.length === 0 && !text) return;
+    const turn = this.ensure(stamp);
+    turn.lastActivity = stamp ?? turn.lastActivity;
+    for (const call of calls) {
+      const step: TurnStep = { tool: call.name, input: call.input, outcome: "running", result: "" };
+      turn.toolCalls += 1;
+      turn.steps.push(step);
+      if (turn.steps.length > MAX_STEPS) turn.steps.shift();
+      if (call.id) turn.open.set(call.id, step);
+    }
+    if (calls.length > 0 || message?.stop_reason === "tool_use") {
+      if (text) turn.narration = text.slice(0, TURN_TEXT);
+      turn.reply = null;
+      turn.replied = false;
+      return;
+    }
+    turn.reply = text;
+    turn.explicitEnd = END_REASONS.has(message?.stop_reason);
+    turn.replied = true;
+  }
+
+  finish(): TurnFacts | null {
+    const pick = this.current && isFiller(this.current) && this.previous ? this.previous : this.current;
+    if (!pick) return null;
+    const reply = pick.replied ? pick.reply : null;
+    return {
+      state: pick.replied ? "replied" : "in-progress",
+      explicitEnd: pick.replied && pick.explicitEnd,
+      prompt: pick.prompt,
+      startedAt: pick.startedAt,
+      lastActivity: pick.lastActivity,
+      reply: reply == null ? null : reply.slice(0, REPLY_MAX),
+      replyTruncated: reply != null && reply.length > REPLY_MAX,
+      narration: pick.narration,
+      toolCalls: pick.toolCalls,
+      toolErrors: pick.toolErrors,
+      openTools: [...pick.open.values()].map((step) => step.tool),
+      steps: pick.steps,
+    };
+  }
+
+  private ensure(stamp: string | null): Building {
+    if (!this.current) this.current = blankTurn("", stamp);
+    return this.current;
+  }
+}
+
+function blankTurn(prompt: string, stamp: string | null): Building {
+  return {
+    prompt,
+    startedAt: stamp,
+    lastActivity: stamp,
+    reply: null,
+    explicitEnd: false,
+    narration: null,
+    toolCalls: 0,
+    toolErrors: 0,
+    steps: [],
+    open: new Map(),
+    replied: false,
+  };
+}
+
+function isFiller(turn: Building): boolean {
+  return turn.replied && turn.toolCalls === 0 && turn.reply === FILLER_REPLY;
+}
+
+function clip(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}...` : flat;
+}
+
+const INPUT_KEYS = ["command", "file_path", "path", "notebook_path", "pattern", "url", "query", "skill", "description", "prompt"] as const;
+
+/** The one argument that says what a tool call does: the command, the file, the pattern. */
+function inputSummary(input: unknown): string {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return "";
+  const fields = input as Record<string, unknown>;
+  for (const key of INPUT_KEYS) {
+    const value = fields[key];
+    if (typeof value === "string" && value.length > 0) return clip(value, STEP_TEXT);
+  }
+  const names = Object.keys(fields).slice(0, 6).join(", ");
+  return names ? `(${names})` : "";
+}
+
+function toolCallsOf(message: unknown): { id: string | null; name: string; input: string }[] {
+  const calls: { id: string | null; name: string; input: string }[] = [];
+  for (const block of blocksOf(message)) {
+    if (block.type !== "tool_use" || typeof block.name !== "string") continue;
+    calls.push({ id: typeof block.id === "string" ? block.id : null, name: block.name, input: inputSummary(block.input) });
+  }
+  return calls;
 }
 
 function flagsFromPrefix(prefix: string): { type: string | null; sidechain: boolean; meta: boolean } {
