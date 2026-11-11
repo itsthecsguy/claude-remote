@@ -47,7 +47,7 @@ node dist/index.js rotate-token
 node dist/index.js http
 ```
 
-`--step-results` sets `CLAUDE_REMOTE_STEP_RESULTS=1` for the helper; see [Waiting for a session](#waiting-for-a-session). `--core-tools` and `--call-timeout=<seconds>` cut what a remote model has to read; see [Brief answers](#brief-answers). `install` prints a `warning=quick-tunnel-url-changes` line when it sets up a quick tunnel.
+`--step-results` sets `CLAUDE_REMOTE_STEP_RESULTS=1` for the helper; see [Waiting for a session](#waiting-for-a-session). `--core-tools` and `--call-timeout=<seconds>` cut what a remote model has to read, and `--full-detail` restores the complete answers of earlier versions; see [Brief answers](#brief-answers). `install` prints a `warning=quick-tunnel-url-changes` line when it sets up a quick tunnel.
 
 `--tunnel=quick|named|token|funnel|none` picks how the helper is reached from outside (default `quick`); see [Stable endpoint](#stable-endpoint). `--no-watchdog` skips the watchdog agent and `--watchdog-interval=<seconds>` (30 to 3600, default 120) sets how often it runs; see [Watchdog](#watchdog).
 
@@ -58,6 +58,18 @@ node dist/index.js http
 The labels are `com.claude-remote.http`, `com.claude-remote.tunnel`, and `com.claude-remote.watchdog`. The plists are under `~/Library/LaunchAgents/` with those names, mode `0600`. The helper and tunnel have `RunAtLoad` and `KeepAlive`; the watchdog has `RunAtLoad` and a `StartInterval`. `--tunnel=funnel` and `--tunnel=none` write no tunnel plist and remove one left by an earlier install.
 
 ## Upgrading an existing install
+
+**0.2.0 changes what the tools return.** Answers are brief by default so a remote model reads far less; see [Brief answers](#brief-answers). A client that reads the tool descriptions needs nothing. A client whose own instructions name fields does:
+
+| Before 0.2.0 | 0.2.0 |
+| --- | --- |
+| `get_session`: `phase.value`, `turn.reply` or `run.result.text`, `card.pending`, `git.dirtyFiles` | `phase`, `reply`, `pending`, `git.dirty` |
+| `list_sessions`: `sessions[].sessionId`, `sessions[].status.value`, 50 rows | `sessions[].id`, `sessions[].status`, 10 rows |
+| `new_session` with a `prompt` and the answer tools return at once | They wait for the session, up to the wait limit, and return the `wait_session` view |
+| `list_pending`: `answerable: false` | `local: true` |
+
+To keep the old answers, pass `detail: "full"` to `get_session`, `wait_session`, or `list_sessions`, or install with `--full-detail` to make every tool answer as before. `node dist/index.js status` prints `version=` and `commit=` for the checkout it runs from.
+
 
 1. In the install directory, pull the new version and build it: `git pull && npm ci && npm run build`.
 2. Optional: give the helper a long-lived login. Run `claude setup-token`, then paste the token into `(umask 077 && mkdir -p ~/.config/claude-remote && cat > ~/.config/claude-remote/oauth-token)` and press Enter, then Ctrl-D. Skip this and you keep the periodic login prompt; see [Long-lived login for headless claude children](#long-lived-login-for-headless-claude-children).
@@ -311,7 +323,7 @@ The caller is usually a language model that pays for every character of every to
 
 `reply` is clipped to 4000 characters (`CLAUDE_REMOTE_REPLY_CHARS`, up to 8000) and `replyTruncated` says when. `pending` entries that already have their answer are left out. `git` leaves out zero counts, so `{"branch":"main","head":"51d7139","pushed":true}` means nothing to commit and nothing to push.
 
-`get_session`, `wait_session`, and `list_sessions` take `detail: "full"` for the complete records described in the sections below. `CLAUDE_REMOTE_DETAIL=full` makes that the default for every tool and turns off the waiting inside `new_session` and the answer tools.
+`get_session`, `wait_session`, and `list_sessions` take `detail: "full"` for the complete records described in the sections below. `CLAUDE_REMOTE_DETAIL=full` (`install --full-detail`) makes that the default for every tool and turns off the waiting inside `new_session` and the answer tools.
 
 Three settings reduce it further:
 

@@ -87,6 +87,8 @@ export type InstallInput = {
   stepResults?: boolean;
   /** Register only the tools a remote caller needs (CLAUDE_REMOTE_TOOLS=core). */
   coreTools?: boolean;
+  /** Return the complete records from every tool, as before 0.2.0 (CLAUDE_REMOTE_DETAIL=full). */
+  fullDetail?: boolean;
   /** The tools/call deadline in seconds (CLAUDE_REMOTE_CALL_TIMEOUT_MS). wait_session can block up to 5 seconds less. */
   callTimeoutS?: number;
   approveTimeoutS?: number;
@@ -233,6 +235,7 @@ export function renderHttpPlist(input: InstallInput): string {
     CLAUDE_REMOTE_APPROVE_TIMEOUT_S: String(input.approveTimeoutS ?? DEFAULT_APPROVE_TIMEOUT_S),
     ...(input.stepResults ? { CLAUDE_REMOTE_STEP_RESULTS: "1" } : {}),
     ...(input.coreTools ? { CLAUDE_REMOTE_TOOLS: "core" } : {}),
+    ...(input.fullDetail ? { CLAUDE_REMOTE_DETAIL: "full" } : {}),
     ...(input.callTimeoutS ? { CLAUDE_REMOTE_CALL_TIMEOUT_MS: String(input.callTimeoutS * 1000) } : {}),
     ...(path.isAbsolute(input.claudeBin) ? { CLAUDE_REMOTE_CLAUDE_BIN: input.claudeBin } : {}),
     ...(publicHost ? { CLAUDE_REMOTE_PUBLIC_HOST: publicHost } : {}),

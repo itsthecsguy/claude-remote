@@ -22,6 +22,7 @@ import {
   type InstallInput,
 } from "../src/install.js";
 import { readToken, tokenPath } from "../src/token.js";
+import { VERSION } from "../src/version.js";
 import { repoRoot, shimPath, tempHome } from "./helpers.js";
 
 const tsx = path.join(repoRoot, "node_modules", ".bin", "tsx");
@@ -663,3 +664,31 @@ function runDesk(
     child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
   });
 }
+
+test("install flags for brief answers reach the helper's environment, and status names the installed version", async () => {
+  const { home } = await tempHome();
+  const recorded = recorder();
+  const plain = await executeInstall(input(home, { dryRun: true, platform: "linux", cloudflaredPresent: false }), recorded.hooks);
+  for (const name of ["CLAUDE_REMOTE_TOOLS", "CLAUDE_REMOTE_DETAIL", "CLAUDE_REMOTE_CALL_TIMEOUT_MS"]) {
+    assert.equal(plain.httpPlist.includes(name), false, `${name} is absent unless asked for`);
+  }
+  const set = await executeInstall(input(home, { dryRun: true, platform: "linux", cloudflaredPresent: false, coreTools: true, fullDetail: true, callTimeoutS: 95 }), recorded.hooks);
+  assert.match(set.httpPlist, /CLAUDE_REMOTE_TOOLS<\/key><string>core<\/string>/);
+  assert.match(set.httpPlist, /CLAUDE_REMOTE_DETAIL<\/key><string>full<\/string>/);
+  assert.match(set.httpPlist, /CLAUDE_REMOTE_CALL_TIMEOUT_MS<\/key><string>95000<\/string>/);
+
+  const bins = { CLAUDE_REMOTE_PLATFORM: "darwin", CLAUDE_REMOTE_CLOUDFLARED_BIN: fakeBin, CLAUDE_REMOTE_BREW_BIN: fakeBin, CLAUDE_REMOTE_LAUNCHCTL_BIN: fakeBin, CLAUDE_REMOTE_CLAUDE_BIN: fakeBin };
+  const preview = await runDesk(home, ["install", "--dry-run", "--core-tools", "--full-detail", "--call-timeout=95"], bins);
+  assert.equal(preview.code, 0, preview.stderr);
+  assert.match(preview.stdout, /CLAUDE_REMOTE_TOOLS<\/key><string>core<\/string>/);
+  assert.match(preview.stdout, /CLAUDE_REMOTE_DETAIL<\/key><string>full<\/string>/);
+  assert.match(preview.stdout, /CLAUDE_REMOTE_CALL_TIMEOUT_MS<\/key><string>95000<\/string>/);
+  assert.equal((await runDesk(home, ["install", "--dry-run", "--call-timeout=96"], bins)).code, 2, "past the tunnel limit is a usage error");
+
+  const pkg = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8")) as { version: string };
+  assert.equal(VERSION, pkg.version);
+  const status = await runDesk(home, ["status", "--no-probe"], bins);
+  assert.match(status.stdout, new RegExp(`^version=${VERSION.replace(/\./g, "\\.")} commit=([0-9a-f]{4,40}|unknown)$`, "m"));
+  const json = JSON.parse((await runDesk(home, ["status", "--no-probe", "--json"], bins)).stdout) as { version: string; commit: string | null };
+  assert.equal(json.version, VERSION);
+});

@@ -6,6 +6,7 @@ import path from "node:path";
 import { logEvent } from "./log.js";
 import type { PendingChange, PendingStore, PendingView } from "./pending.js";
 import { tokenDirectory } from "./token.js";
+import { VERSION } from "./version.js";
 
 /**
  * Optional push alerts for new pending entries.
@@ -194,7 +195,7 @@ export function notifyPayload(view: PendingView, event: "pending" | "cleared", s
 export function notifyHeaders(body: string, settings: Pick<NotifySettings, "secret" | "auth">, eventId: string, nowMs: number): Record<string, string> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    "user-agent": "claude-remote/0.1.0",
+    "user-agent": `claude-remote/${VERSION}`,
     "x-claude-remote-delivery": eventId,
   };
   if (!settings.secret) return headers;

@@ -23,6 +23,7 @@ import { loadNotifySettings, startNotifier } from "./notify.js";
 import { pendingStore, registerPendingTools } from "./pending.js";
 import { bearerMatches, readToken } from "./token.js";
 import { answerFollow, launchFollow, registerTools } from "./tools.js";
+import { VERSION } from "./version.js";
 
 export const HTTP_HOST = "127.0.0.1";
 export const HTTP_PORT = 47321;
@@ -266,7 +267,7 @@ function plain(res: ServerResponse, body: string): void {
 
 function deskFactory(config: Config): () => McpServer {
   return () => {
-    const server = new McpServer({ name: "claude-remote", version: "0.1.0" });
+    const server = new McpServer({ name: "claude-remote", version: VERSION });
     registerTools(server, config);
     registerLaunchTools(server, config, launchFollow(config));
     registerDeliverTool(server, config);

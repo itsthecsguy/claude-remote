@@ -29,6 +29,7 @@ import { showSession, type ShowView } from "./show.js";
 import { mintToken, tokenPath, writeToken } from "./token.js";
 import { RENAME_MESSAGE, sendFollowup } from "./tools.js";
 import type { FollowupOutcome } from "./queue.js";
+import { installedCommit, VERSION } from "./version.js";
 
 const COMMANDS = ["list", "show", "new", "continue", "send", "rename", "stop", "cleanup", "http", "install", "uninstall", "status", "rotate-token", "watchdog"] as const;
 
@@ -46,7 +47,7 @@ type Parsed =
   | { command: "stop"; json: boolean; sessionId?: string; target?: string }
   | { command: "cleanup"; json: boolean }
   | { command: "http"; port?: number }
-  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; stepResults: boolean; coreTools: boolean; callTimeoutS?: number; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags; tunnel: TunnelFlags; watchdog: boolean; watchdogIntervalS?: number }
+  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; stepResults: boolean; coreTools: boolean; fullDetail: boolean; callTimeoutS?: number; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags; tunnel: TunnelFlags; watchdog: boolean; watchdogIntervalS?: number }
   | { command: "uninstall"; json: boolean; dryRun: boolean; purge: boolean }
   | { command: "status"; json: boolean; probe: boolean }
   | { command: "rotate-token"; json: boolean }
@@ -176,6 +177,7 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         allowApprove: parsed.allowApprove,
         stepResults: parsed.stepResults,
         coreTools: parsed.coreTools,
+        fullDetail: parsed.fullDetail,
         callTimeoutS: parsed.callTimeoutS,
         approveTimeoutS: parsed.approveTimeoutS ?? approveTimeoutSeconds(env.CLAUDE_REMOTE_APPROVE_TIMEOUT_S),
         hooks: parsed.hooks,
@@ -217,7 +219,8 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         undefined,
         { probe: parsed.probe && env.CLAUDE_REMOTE_PROBE !== "0" ? undefined : null, oauthTokenFile: config.oauthTokenFile },
       );
-      io.stdout(parsed.json ? `${JSON.stringify(report)}\n` : statusText(report));
+      const commit = await installedCommit();
+      io.stdout(parsed.json ? `${JSON.stringify({ ...report, version: VERSION, commit })}\n` : `${statusText(report)}version=${VERSION} commit=${commit ?? "unknown"}\n`);
       return 0;
     }
     case "watchdog": {
@@ -419,6 +422,7 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
   let allowApprove = false;
   let stepResults = false;
   let coreTools = false;
+  let fullDetail = false;
   let callTimeoutS: number | undefined;
   let approveTimeoutS: number | undefined;
   let hooks = true;
@@ -445,6 +449,7 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     else if (token === "--allow-approve" && command === "install") allowApprove = true;
     else if (token === "--step-results" && command === "install") stepResults = true;
     else if (token === "--core-tools" && command === "install") coreTools = true;
+    else if (token === "--full-detail" && command === "install") fullDetail = true;
     else if (token.startsWith("--call-timeout=") && command === "install") callTimeoutS = parseCallTimeout(token.slice("--call-timeout=".length));
     else if (token === "--no-hooks" && command === "install") hooks = false;
     else if (token === "--no-watchdog" && command === "install") watchdog = false;
@@ -462,7 +467,7 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     case "install":
       if (purge) throw new DeskError("usage", USAGE);
       if (!notify.url && (notify.secret || notify.auth || notify.includeText || notify.cleared)) throw new DeskError("usage", USAGE);
-      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, stepResults, coreTools, callTimeoutS, approveTimeoutS, hooks, port, notify, tunnel, watchdog, watchdogIntervalS };
+      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, stepResults, coreTools, fullDetail, callTimeoutS, approveTimeoutS, hooks, port, notify, tunnel, watchdog, watchdogIntervalS };
     case "uninstall":
       if (allowSend || allowLaunch || port != null) throw new DeskError("usage", USAGE);
       return { command, json, dryRun, purge };
