@@ -54,9 +54,8 @@ test("a clean machine with an empty home initializes and lists no sessions", asy
     const message = JSON.parse(listed.body) as { result?: { content?: Array<{ text?: string }> } };
     const text = message.result?.content?.[0]?.text;
     assert.equal(typeof text, "string");
-    const page = JSON.parse(text ?? "") as { sessions?: unknown[]; scannedFileCount?: number };
-    assert.deepEqual(page.sessions, []);
-    assert.equal(page.scannedFileCount, 0);
+    const page = JSON.parse(text ?? "") as { sessions?: unknown[]; more?: number };
+    assert.deepEqual(page, { sessions: [] });
     assert.equal(listed.body.includes(token), false);
     assert.equal(Buffer.concat(stderr).toString("utf8").includes(token), false);
   } finally {

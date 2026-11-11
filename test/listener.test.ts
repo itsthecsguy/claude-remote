@@ -173,8 +173,8 @@ test("list_sessions answers from a launchd-like child", { timeout: 20_000 }, asy
       params: { name: "list_sessions", arguments: { note: "SECRET-ARGUMENT" } },
     }, 8000);
     assert.equal(listed.status, 200, `${listed.body}\n${stderr}`);
-    const page = JSON.parse(rpcText(listed.body)) as { sessions?: Array<{ sessionId?: string; cwd?: string }> };
-    assert.equal(page.sessions?.some((session) => session.sessionId === ID && session.cwd === cwd), true);
+    const page = JSON.parse(rpcText(listed.body)) as { sessions?: Array<{ id?: string; project?: string }> };
+    assert.equal(page.sessions?.some((session) => session.id === ID && session.project === path.basename(cwd)), true);
     assert.equal(listed.body.includes(token), false);
     assert.equal(stderr.includes(token), false);
     assert.equal(stderr.includes("SECRET-ARGUMENT"), false);

@@ -148,6 +148,7 @@ if (!config.allowSend) {
 }
 try {
   const result = await sendFollowup(config, {
+    waitForExit: true,
     sessionId: executeId,
     message,
     confirm: true,
@@ -179,6 +180,10 @@ try {
       console.log(`send disposition=rejected code=${result.code} displayedInDesktop=${result.displayedInDesktop}`);
       console.log(result.notice);
       await printHeld(executeId);
+      break;
+    case "started":
+      console.log(`send disposition=started ticketId=${result.ticketId}`);
+      console.log(result.notice);
       break;
     case "unsupported":
       console.log(`send disposition=unsupported code=${result.code} displayedInDesktop=${result.displayedInDesktop}`);

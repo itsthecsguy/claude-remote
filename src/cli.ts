@@ -1,4 +1,4 @@
-import { approveTimeoutSeconds, MAX_APPROVE_TIMEOUT_S, parseConfig, type Config } from "./config.js";
+import { approveTimeoutSeconds, MAX_APPROVE_TIMEOUT_S, MAX_CALL_TIMEOUT_MS, parseConfig, type Config } from "./config.js";
 import { cleanupDesk } from "./cleanup.js";
 import { DeskError, assertNever } from "./domain.js";
 import { listenHttp, resolveHttpPort, HTTP_HOST } from "./http.js";
@@ -29,6 +29,7 @@ import { showSession, type ShowView } from "./show.js";
 import { mintToken, tokenPath, writeToken } from "./token.js";
 import { RENAME_MESSAGE, sendFollowup } from "./tools.js";
 import type { FollowupOutcome } from "./queue.js";
+import { installedCommit, VERSION } from "./version.js";
 
 const COMMANDS = ["list", "show", "new", "continue", "send", "rename", "stop", "cleanup", "http", "install", "uninstall", "status", "rotate-token", "watchdog"] as const;
 
@@ -46,7 +47,7 @@ type Parsed =
   | { command: "stop"; json: boolean; sessionId?: string; target?: string }
   | { command: "cleanup"; json: boolean }
   | { command: "http"; port?: number }
-  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags; tunnel: TunnelFlags; watchdog: boolean; watchdogIntervalS?: number }
+  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; stepResults: boolean; coreTools: boolean; fullDetail: boolean; callTimeoutS?: number; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags; tunnel: TunnelFlags; watchdog: boolean; watchdogIntervalS?: number }
   | { command: "uninstall"; json: boolean; dryRun: boolean; purge: boolean }
   | { command: "status"; json: boolean; probe: boolean }
   | { command: "rotate-token"; json: boolean }
@@ -117,6 +118,7 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
     }
     case "send": {
       const outcome = await sendFollowup(config, {
+        waitForExit: true,
         sessionId: parsed.sessionId,
         message: parsed.message,
         confirm: parsed.yes,
@@ -173,6 +175,10 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         allowSend: parsed.allowSend,
         allowLaunch: parsed.allowLaunch,
         allowApprove: parsed.allowApprove,
+        stepResults: parsed.stepResults,
+        coreTools: parsed.coreTools,
+        fullDetail: parsed.fullDetail,
+        callTimeoutS: parsed.callTimeoutS,
         approveTimeoutS: parsed.approveTimeoutS ?? approveTimeoutSeconds(env.CLAUDE_REMOTE_APPROVE_TIMEOUT_S),
         hooks: parsed.hooks,
         notify: notifyInput(parsed.notify, env),
@@ -213,7 +219,8 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         undefined,
         { probe: parsed.probe && env.CLAUDE_REMOTE_PROBE !== "0" ? undefined : null, oauthTokenFile: config.oauthTokenFile },
       );
-      io.stdout(parsed.json ? `${JSON.stringify(report)}\n` : statusText(report));
+      const commit = await installedCommit();
+      io.stdout(parsed.json ? `${JSON.stringify({ ...report, version: VERSION, commit })}\n` : `${statusText(report)}version=${VERSION} commit=${commit ?? "unknown"}\n`);
       return 0;
     }
     case "watchdog": {
@@ -413,6 +420,10 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
   let allowSend = false;
   let allowLaunch = false;
   let allowApprove = false;
+  let stepResults = false;
+  let coreTools = false;
+  let fullDetail = false;
+  let callTimeoutS: number | undefined;
   let approveTimeoutS: number | undefined;
   let hooks = true;
   let purge = false;
@@ -436,6 +447,10 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     else if (token === "--allow-send") allowSend = true;
     else if (token === "--allow-launch") allowLaunch = true;
     else if (token === "--allow-approve" && command === "install") allowApprove = true;
+    else if (token === "--step-results" && command === "install") stepResults = true;
+    else if (token === "--core-tools" && command === "install") coreTools = true;
+    else if (token === "--full-detail" && command === "install") fullDetail = true;
+    else if (token.startsWith("--call-timeout=") && command === "install") callTimeoutS = parseCallTimeout(token.slice("--call-timeout=".length));
     else if (token === "--no-hooks" && command === "install") hooks = false;
     else if (token === "--no-watchdog" && command === "install") watchdog = false;
     else if (token.startsWith("--watchdog-interval=") && command === "install") watchdogIntervalS = parseWatchdogInterval(token.slice("--watchdog-interval=".length));
@@ -452,7 +467,7 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     case "install":
       if (purge) throw new DeskError("usage", USAGE);
       if (!notify.url && (notify.secret || notify.auth || notify.includeText || notify.cleared)) throw new DeskError("usage", USAGE);
-      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, approveTimeoutS, hooks, port, notify, tunnel, watchdog, watchdogIntervalS };
+      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, stepResults, coreTools, fullDetail, callTimeoutS, approveTimeoutS, hooks, port, notify, tunnel, watchdog, watchdogIntervalS };
     case "uninstall":
       if (allowSend || allowLaunch || port != null) throw new DeskError("usage", USAGE);
       return { command, json, dryRun, purge };
@@ -524,6 +539,13 @@ function parseApproveTimeout(raw: string): number {
   return parsed;
 }
 
+/** Seconds one tools/call may take, which also bounds how long wait_session can block. */
+function parseCallTimeout(raw: string): number {
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 10 || parsed * 1000 > MAX_CALL_TIMEOUT_MS) throw new DeskError("usage", USAGE);
+  return parsed;
+}
+
 function parsePort(raw: string): number {
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) throw new DeskError("usage", USAGE);
@@ -538,6 +560,9 @@ function urlWaitMs(env: NodeJS.ProcessEnv): number {
   return Math.min(Math.floor(parsed), 20000);
 }
 
+export const QUICK_TUNNEL_WARNING =
+  "warning=quick-tunnel-url-changes: this URL is replaced every time the tunnel restarts, and the connector stops working until it is updated. Install with --tunnel=funnel or --tunnel=named for an address that stays.";
+
 function installText(report: InstallReport): string {
   return [
     `dryRun=${report.dryRun ? "yes" : "no"}`,
@@ -545,6 +570,7 @@ function installText(report: InstallReport): string {
     `tunnelMode=${report.tunnelMode}`,
     `publicHost=${report.publicHost ?? "-"}`,
     `url=${report.url ?? "-"}`,
+    ...(report.tunnelMode === "quick" ? [QUICK_TUNNEL_WARNING] : []),
     `port=${report.port}`,
     `brew=${report.brew}`,
     `watchdog=${report.watchdogPlist ? "yes" : "no"}`,
@@ -657,6 +683,8 @@ function publicSend(outcome: FollowupOutcome): PublicSend {
         ticketId: outcome.ticketId,
         attachmentCount,
       };
+    case "started":
+      return { disposition: "started", sessionId: outcome.sessionId, ticketId: outcome.ticketId, attachmentCount };
     case "queued":
       return {
         disposition: "queued",

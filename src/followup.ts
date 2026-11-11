@@ -5,8 +5,10 @@ import { homedir } from "node:os";
 import { runBoundedNode } from "./bounded.js";
 import type { WorktreeLaunch } from "./domain.js";
 import { DeskError } from "./domain.js";
+import { resultFromRecord, StreamReader, type RunResult } from "./runs.js";
 
-const MAX_STDOUT = 2_000_000;
+/** How long after exit to keep reading a stdout pipe that has not closed. */
+export const EXIT_DRAIN_MS = 2000;
 
 export const DESKTOP_NOTICE =
   "A resumed run happens in this subprocess, outside the desktop window, and it is not documented to appear live there.";
@@ -180,7 +182,7 @@ export async function spawnClaude(input: {
   onChild?: (pid: number) => Promise<void>;
   /** The child environment, normally from claudeChildEnv so the setup-token login is available. */
   env?: NodeJS.ProcessEnv;
-}): Promise<{ result: string; exitCode: number; sessionId: string | null }> {
+}): Promise<{ result: string; exitCode: number; sessionId: string | null; run: RunResult | null }> {
   const child = spawn(input.bin, input.args, {
     cwd: input.cwd,
     detached: true,
@@ -190,18 +192,17 @@ export async function spawnClaude(input: {
   if (!child.stdin || !child.stdout || !child.stderr) {
     throw new DeskError("spawn-failed", "failed to spawn claude");
   }
-  const stdoutChunks: Buffer[] = [];
-  let stdoutLen = 0;
-  let tooLarge = false;
-  child.stdout.on("data", (chunk: Buffer) => {
-    stdoutLen += chunk.length;
-    if (stdoutLen > MAX_STDOUT) {
-      tooLarge = true;
-      killGroup(child.pid);
-      return;
-    }
-    stdoutChunks.push(chunk);
+  // The stream is read record by record and only the result and the session id are kept. Holding
+  // the whole stream and killing the child past a size cap ended long runs in the middle of work.
+  const parsed: { result: string; sessionId: string | null; run: RunResult | null } = { result: "", sessionId: null, run: null };
+  const reader = new StreamReader((msg) => {
+    if (!msg || typeof msg !== "object") return;
+    const record = msg as { type?: unknown; result?: unknown; session_id?: unknown };
+    if (typeof record.session_id === "string") parsed.sessionId = record.session_id;
+    if (record.type === "result" && typeof record.result === "string") parsed.result = record.result;
+    parsed.run = resultFromRecord(msg) ?? parsed.run;
   });
+  child.stdout.on("data", (chunk: Buffer) => reader.feed(chunk));
   const stderrChunks: Buffer[] = [];
   let stderrLen = 0;
   child.stderr.on("data", (chunk: Buffer) => {
@@ -236,8 +237,13 @@ export async function spawnClaude(input: {
     child.on("error", (error: NodeJS.ErrnoException) => {
       finish({ code: 127, timedOut: false, spawnError: error });
     });
-    child.on("exit", (code) => {
+    // close, not exit: stdout has ended by then, so the result record has been read. A process the
+    // child left behind can hold the pipe open, so an exit is honoured after a short drain anyway.
+    child.on("close", (code) => {
       finish({ code: code ?? 1, timedOut: false, spawnError: null });
+    });
+    child.on("exit", (code) => {
+      setTimeout(() => finish({ code: code ?? 1, timedOut: false, spawnError: null }), EXIT_DRAIN_MS).unref();
     });
   });
 
@@ -245,35 +251,14 @@ export async function spawnClaude(input: {
     await waitExit(child, 1000);
     throw new DeskError("timeout", "send timed out");
   }
-  if (tooLarge) throw new DeskError("too-large", "claude output exceeded the capture limit");
   if (outcome.spawnError) {
     if (outcome.spawnError.code === "ENOENT") throw new DeskError("spawn-failed", "claude binary not found");
     throw new DeskError("spawn-failed", "failed to spawn claude");
   }
-  const stdout = Buffer.concat(stdoutChunks).toString("utf8");
   let stderr = Buffer.concat(stderrChunks).toString("utf8").slice(0, 500);
   if (input.redact.length > 0) stderr = stderr.split(input.redact).join("[message]");
-  const parsed = parseStream(stdout);
   const result = parsed.result.length > 0 ? parsed.result : stderr.trim();
-  return { result, exitCode: outcome.code, sessionId: parsed.sessionId };
-}
-
-function parseStream(stdout: string): { result: string; sessionId: string | null } {
-  let result = "";
-  let sessionId: string | null = null;
-  for (const line of stdout.split("\n")) {
-    if (line.trim().length === 0) continue;
-    try {
-      const msg: unknown = JSON.parse(line);
-      if (!msg || typeof msg !== "object") continue;
-      const record = msg as { type?: unknown; result?: unknown; session_id?: unknown };
-      if (typeof record.session_id === "string") sessionId = record.session_id;
-      if (record.type === "result" && typeof record.result === "string") result = record.result;
-    } catch {
-      continue;
-    }
-  }
-  return { result, sessionId };
+  return { result, exitCode: outcome.code, sessionId: parsed.sessionId, run: parsed.run };
 }
 
 function killGroup(pid: number | undefined): void {

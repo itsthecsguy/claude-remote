@@ -1,4 +1,5 @@
 import type { PendingView } from "./pending.js";
+import type { RunRecord } from "./runs.js";
 export type SessionId = string & { readonly __brand: "SessionId" };
 
 export type DesktopSessionId = string & { readonly __brand: "DesktopSessionId" };
@@ -82,11 +83,86 @@ export type SessionSummary = {
   coverage: SummaryCoverage;
 };
 
+/** One tool call in the current turn, paired with its result by tool_use_id. */
+export type TurnStep = {
+  tool: string;
+  /** The command, file path, pattern, or other main argument, clipped. */
+  input: string;
+  outcome: "ok" | "error" | "running";
+  /** The start of the tool result, clipped. Empty while the call is running. */
+  result: string;
+};
+
+/**
+ * The newest prompt in the transcript and what has happened since, read from the whole file.
+ * state is what the transcript shows on its own: replied when the last record of the turn is an
+ * assistant message with no tool call. explicitEnd says that message carried an end stop_reason.
+ */
+export type TurnFacts = {
+  state: "replied" | "in-progress";
+  explicitEnd: boolean;
+  prompt: string;
+  startedAt: string | null;
+  lastActivity: string | null;
+  /** The final assistant text of this turn. null until the turn has replied. */
+  reply: string | null;
+  replyTruncated: boolean;
+  /** The newest assistant text written between tool calls, clipped. */
+  narration: string | null;
+  toolCalls: number;
+  toolErrors: number;
+  /** Names of tool calls that have no result yet. */
+  openTools: string[];
+  /** The newest tool calls of this turn, oldest first. */
+  steps: TurnStep[];
+};
+
+export type PhaseValue = "working" | "needs-input" | "done" | "interrupted" | "failed" | "stopped" | "idle" | "unknown";
+
+/** One verdict that combines process status, pending prompts, and the transcript turn. */
+export type SessionPhase = {
+  value: PhaseValue;
+  reason: string;
+};
+
 export type SessionDetail = {
   card: SessionCard;
   turns: Turn[];
   summary: SessionSummary;
   lastReply: string;
+  phase: SessionPhase;
+  turn: TurnFacts | null;
+  /** The newest claude child this server started for the session, with its final result. */
+  run: RunRecord | null;
+  /** The state of the checkout the session works in, read with git at call time. */
+  git: GitFacts | null;
+};
+
+export type GitFacts = {
+  head: string | null;
+  branch: string | null;
+  upstream: string | null;
+  /** Commits on the branch that its upstream does not have, as of the last fetch or push. */
+  ahead: number | null;
+  behind: number | null;
+  /** Files with uncommitted changes, untracked files included. */
+  dirtyFiles: number;
+  /** true when the branch has an upstream and nothing to push. null without an upstream. */
+  pushed: boolean | null;
+};
+
+/** What wait_session returns: the same facts as get_session without the turn list. */
+export type WaitResult = {
+  sessionId: SessionId;
+  timedOut: boolean;
+  waitedMs: number;
+  phase: SessionPhase;
+  status: SessionStatus;
+  turn: TurnFacts | null;
+  run: RunRecord | null;
+  pending: PendingView[];
+  git: GitFacts | null;
+  next: string;
 };
 
 export type TailEnd =

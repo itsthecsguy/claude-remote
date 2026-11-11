@@ -22,7 +22,7 @@ import {
 } from "./launches.js";
 import { processIdentity, sessionRecordForPid, type ProcessIdentityLookup } from "./registry.js";
 import { listCmdlines } from "./running.js";
-import { FORBIDDEN_FLAGS } from "./followup.js";
+import { EXIT_DRAIN_MS, FORBIDDEN_FLAGS } from "./followup.js";
 import {
   assertNoBypass,
   cloudArgs,
@@ -46,7 +46,9 @@ import {
   TMUX_INSTALL_HINT,
   type BlockingDialog,
 } from "./terminal.js";
+import { resultFromRecord, runStore, StreamReader, type RunResult } from "./runs.js";
 import { continueCommand, type CommandLister } from "./tools.js";
+import { briefStart } from "./brief.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -335,7 +337,8 @@ const HEADLESS_CHILDREN = new Map<string, ChildProcess>();
 /**
  * Start `claude -p --output-format stream-json --verbose` with the prompt on stdin, read lines
  * until the system/init event, and return its session id and fast_mode_state. The child keeps
- * running detached. Its output is drained and dropped, never logged.
+ * running detached. Its output is read to the end for one thing only, the final result record,
+ * which goes to the run store with the exit code. Nothing from the stream is logged.
  */
 async function startHeadless(config: Config, cwd: string, options: LaunchOptions, prepare: boolean): Promise<StartResult> {
   const started = Date.now();
@@ -344,9 +347,9 @@ async function startHeadless(config: Config, cwd: string, options: LaunchOptions
   assertNoBypass(args, FORBIDDEN_FLAGS);
   assertSpawnAllowed(config.claudeBin);
   const child = spawn(config.claudeBin, args, { cwd, detached: true, stdio: ["pipe", "pipe", "ignore"], env: await claudeChildEnv(config) });
-  const init = readInit(child, Math.max(config.launchWaitMs, 1000));
+  const stream = watchHeadless(child, Math.max(config.launchWaitMs, 1000));
   child.stdin?.end(options.prompt ?? "");
-  const facts = await init;
+  const facts = await stream.init;
   child.unref();
   (child.stdout as { unref?: () => void } | null)?.unref?.();
   const recordId = freshRecordId();
@@ -357,6 +360,11 @@ async function startHeadless(config: Config, cwd: string, options: LaunchOptions
       HEADLESS_CHILDREN.delete(recordId);
       void removeLaunch(config.home, recordId);
     });
+  }
+  const runSession = facts?.sessionId ?? null;
+  if (runSession) {
+    await runStore.begin(config.home, runSession, "launch");
+    void stream.closed.then((code) => runStore.end(config.home, runSession, code, stream.result()));
   }
   await writeLaunch(config.home, {
     recordId,
@@ -390,41 +398,56 @@ async function startHeadless(config: Config, cwd: string, options: LaunchOptions
   };
 }
 
-/** Resolve with the init facts, or null at the deadline or exit. Every line after init is dropped. */
-function readInit(child: ChildProcess, timeoutMs: number): Promise<InitFacts | null> {
-  return new Promise<InitFacts | null>((resolve) => {
-    let buffer = "";
-    let settled = false;
-    const finish = (value: InitFacts | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      buffer = "";
-      resolve(value);
-    };
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    child.stdout?.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      buffer += chunk.toString("utf8");
-      if (buffer.length > 1_000_000) {
-        finish(null);
-        return;
-      }
-      let newline = buffer.indexOf("\n");
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        const facts = initFromLine(line);
-        if (facts) {
-          finish(facts);
-          return;
-        }
-        newline = buffer.indexOf("\n");
-      }
-    });
-    child.once("error", () => finish(null));
-    child.once("exit", () => finish(null));
+/**
+ * Read the child's stream-json to its end. init resolves with the init facts, or null at the
+ * deadline or exit. closed resolves with the exit code once stdout has ended, so the result
+ * record, which is the last line, has been seen by then.
+ */
+function watchHeadless(child: ChildProcess, timeoutMs: number): {
+  init: Promise<InitFacts | null>;
+  closed: Promise<number | null>;
+  result: () => RunResult | null;
+} {
+  let result: RunResult | null = null;
+  let settled = false;
+  let resolveInit: (value: InitFacts | null) => void = () => undefined;
+  const init = new Promise<InitFacts | null>((resolve) => {
+    resolveInit = resolve;
   });
+  const finish = (value: InitFacts | null): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolveInit(value);
+  };
+  const timer = setTimeout(() => finish(null), timeoutMs);
+  const reader = new StreamReader((record) => {
+    if (!settled) {
+      const facts = initFromLine(JSON.stringify(record));
+      if (facts) finish(facts);
+    }
+    const parsed = resultFromRecord(record);
+    if (parsed) result = parsed;
+  });
+  child.stdout?.on("data", (chunk: Buffer) => reader.feed(chunk));
+  const closed = new Promise<number | null>((resolve) => {
+    child.once("error", () => {
+      finish(null);
+      resolve(null);
+    });
+    child.once("close", (code) => {
+      finish(null);
+      resolve(code);
+    });
+    // A process the child left behind can hold the pipe open past its exit.
+    child.once("exit", (code) => {
+      setTimeout(() => {
+        finish(null);
+        resolve(code);
+      }, EXIT_DRAIN_MS).unref();
+    });
+  });
+  return { init, closed, result: () => result };
 }
 
 async function stopHeadless(
@@ -662,14 +685,22 @@ export function assertSpawnAllowed(bin: string): void {
   }
 }
 
-const NEW_SESSION_DESCRIPTION = "Start a session in a folder. Requires the launch gate. With no options it starts an interactive terminal session in tmux. worktree (true, or a name of letters, digits, dot, dash, underscore) adds --worktree. fastMode true adds --settings {\"fastMode\":true}; it is off unless set because fast mode bills extra usage. prompt starts a headless -p session instead and returns the session id and fast_mode_state from its init event; an interactive launch has no init event, so fastMode.state is null there. cloud with a task description runs claude --cloud in tmux and returns the cloud session id once printed. cloud plus environment (a ccpool_ id) runs claude -p <description> --environment <id> --output-format json. cloud does not combine with worktree, fastMode, or prompt. Sends Enter on the development-channels prompt only when acceptDevChannelPrompt is true and the highlighted line is the accept option. Does not answer workspace trust, a new MCP server prompt, or the Chrome extension prompt. No permission-bypass flag is ever passed.";
+const NEW_SESSION_DESCRIPTION = "Start a session in folder. With prompt it runs headless (claude -p) and returns the session id; without one it opens an interactive tmux session. worktree (true or a name) adds --worktree. fastMode true turns on fast mode, which bills extra usage. cloud (a task description, optionally with environment, a ccpool_ id) starts a cloud session and does not combine with worktree, fastMode, or prompt. acceptDevChannelPrompt true accepts the development-channels prompt; no other startup dialog is answered. No permission-bypass flag is passed.";
 
-export function registerLaunchTools(server: McpServer, config: Config): void {
+const NEW_SESSION_FOLLOW_NOTE = " With prompt, it then waits as wait_session does and returns that view with the session id; call wait_session only when timedOut is true.";
+
+/** follow, when given, runs after a headless start and its result is returned with the session id. */
+export function registerLaunchTools(
+  server: McpServer,
+  config: Config,
+  follow?: (sessionId: string, elapsedMs: number) => Promise<object>,
+): void {
   if (!config.allowLaunch) return;
+  const brief = config.detail === "brief";
   server.registerTool(
     "new_session",
     {
-      description: NEW_SESSION_DESCRIPTION,
+      description: follow ? NEW_SESSION_DESCRIPTION + NEW_SESSION_FOLLOW_NOTE : NEW_SESSION_DESCRIPTION,
       inputSchema: z.object({
         folder: z.string().min(1),
         name: z.string().min(1).max(80).optional(),
@@ -684,6 +715,7 @@ export function registerLaunchTools(server: McpServer, config: Config): void {
     },
     async (args) => {
       try {
+        const began = Date.now();
         const started = await startNew(config, {
           folder: args.folder,
           tmuxName: args.name,
@@ -697,13 +729,18 @@ export function registerLaunchTools(server: McpServer, config: Config): void {
             prompt: args.prompt,
           },
         });
-        return { content: [{ type: "text", text: JSON.stringify(started) }] };
+        if (!brief) return { content: [{ type: "text", text: JSON.stringify(started) }] };
+        if (follow && started.kind === "headless" && started.sessionId) {
+          const view = { sessionId: started.sessionId, ...(await follow(started.sessionId, Date.now() - began)) };
+          return { content: [{ type: "text", text: JSON.stringify(view) }] };
+        }
+        return { content: [{ type: "text", text: JSON.stringify(briefStart(started)) }] };
       } catch (error) {
         return launchToolError(error);
       }
     },
   );
-  server.registerTool(
+  if (config.toolset !== "core") server.registerTool(
     "continue_session",
     {
       description: "Launch a resumed terminal session. Requires the launch gate. Refuses a live owner unless confirmLiveOwner is true, and still refuses if that process is alive. Sends Enter on the development-channels prompt only when acceptDevChannelPrompt is true and the highlighted line is the accept option.",
@@ -724,7 +761,7 @@ export function registerLaunchTools(server: McpServer, config: Config): void {
           tmuxName: args.name,
           prepare: args.prepare === true,
         });
-        return { content: [{ type: "text", text: JSON.stringify(started) }] };
+        return { content: [{ type: "text", text: JSON.stringify(brief ? briefStart(started) : started) }] };
       } catch (error) {
         return launchToolError(error);
       }

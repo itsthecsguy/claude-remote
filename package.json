@@ -1,6 +1,6 @@
 {
   "name": "claude-remote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "List local coding sessions and resume one through the claude CLI when send is enabled.",
   "author": "thecsguy <thecsguy@mail.grokbot.com>",
   "repository": {

@@ -47,6 +47,8 @@ node dist/index.js rotate-token
 node dist/index.js http
 ```
 
+`--step-results` sets `CLAUDE_REMOTE_STEP_RESULTS=1` for the helper; see [Waiting for a session](#waiting-for-a-session). `--core-tools` and `--call-timeout=<seconds>` cut what a remote model has to read, and `--full-detail` restores the complete answers of earlier versions; see [Brief answers](#brief-answers). `install` prints a `warning=quick-tunnel-url-changes` line when it sets up a quick tunnel.
+
 `--tunnel=quick|named|token|funnel|none` picks how the helper is reached from outside (default `quick`); see [Stable endpoint](#stable-endpoint). `--no-watchdog` skips the watchdog agent and `--watchdog-interval=<seconds>` (30 to 3600, default 120) sets how often it runs; see [Watchdog](#watchdog).
 
 `install` resolves `claude` (or `CLAUDE_REMOTE_CLAUDE_BIN`) against the installing shell's `PATH` and writes the absolute path into the helper plist as `CLAUDE_REMOTE_CLAUDE_BIN`, because launchd starts the helper with a fixed `PATH` that usually lacks `~/.local/bin`. `--dry-run` prints the plists and writes nothing. Running `install` again keeps the existing token and rewrites the plists. It always reloads the helper, but leaves a loaded tunnel running when the tunnel plist is unchanged, so a quick-tunnel URL survives a reinstall. `--allow-send` and `--allow-launch` default to off in the LaunchAgent. Passing them sets `CLAUDE_REMOTE_ALLOW_SEND` and `CLAUDE_REMOTE_ALLOW_LAUNCH` to `1` for the helper only. A foreground `node dist/index.js http` uses the environment of that process instead.
@@ -56,6 +58,18 @@ node dist/index.js http
 The labels are `com.claude-remote.http`, `com.claude-remote.tunnel`, and `com.claude-remote.watchdog`. The plists are under `~/Library/LaunchAgents/` with those names, mode `0600`. The helper and tunnel have `RunAtLoad` and `KeepAlive`; the watchdog has `RunAtLoad` and a `StartInterval`. `--tunnel=funnel` and `--tunnel=none` write no tunnel plist and remove one left by an earlier install.
 
 ## Upgrading an existing install
+
+**0.2.0 changes what the tools return.** Answers are brief by default so a remote model reads far less; see [Brief answers](#brief-answers). A client that reads the tool descriptions needs nothing. A client whose own instructions name fields does:
+
+| Before 0.2.0 | 0.2.0 |
+| --- | --- |
+| `get_session`: `phase.value`, `turn.reply` or `run.result.text`, `card.pending`, `git.dirtyFiles` | `phase`, `reply`, `pending`, `git.dirty` |
+| `list_sessions`: `sessions[].sessionId`, `sessions[].status.value`, 50 rows | `sessions[].id`, `sessions[].status`, 10 rows |
+| `new_session` with a `prompt` and the answer tools return at once | They wait for the session, up to the wait limit, and return the `wait_session` view |
+| `list_pending`: `answerable: false` | `local: true` |
+
+To keep the old answers, pass `detail: "full"` to `get_session`, `wait_session`, or `list_sessions`, or install with `--full-detail` to make every tool answer as before. `node dist/index.js status` prints `version=` and `commit=` for the checkout it runs from.
+
 
 1. In the install directory, pull the new version and build it: `git pull && npm ci && npm run build`.
 2. Optional: give the helper a long-lived login. Run `claude setup-token`, then paste the token into `(umask 077 && mkdir -p ~/.config/claude-remote && cat > ~/.config/claude-remote/oauth-token)` and press Enter, then Ctrl-D. Skip this and you keep the periodic login prompt; see [Long-lived login for headless claude children](#long-lived-login-for-headless-claude-children).
@@ -257,6 +271,7 @@ These are the method names.
 | `continue_command` | always. Returns a shell command and does not launch. |
 | `rename_session` | always. Reports that no documented route sets the title. It does not edit a transcript. |
 | `cleanup_desk` | always. Removes stale channel sockets and expired attachment directories. It does not delete key files. |
+| `wait_session` | always. Blocks until the session stops working or the timeout passes. See [Waiting for a session](#waiting-for-a-session). |
 | `send_followup` | `CLAUDE_REMOTE_ALLOW_SEND=1`. The call still has to set `confirm` to true. |
 | `queue_status` | `CLAUDE_REMOTE_ALLOW_SEND=1` |
 | `new_session` | `CLAUDE_REMOTE_ALLOW_LAUNCH=1` |
@@ -267,7 +282,7 @@ These are the method names.
 | `answer_permission` | `CLAUDE_REMOTE_ALLOW_APPROVE=1`. The call still has to set `confirm` to true. |
 | `answer_question` | `CLAUDE_REMOTE_ALLOW_APPROVE=1`. The call still has to set `confirm` to true. |
 
-`install --allow-send` registers `send_followup` and `queue_status`. `install --allow-launch` registers `new_session`, `continue_session`, and `stop_session`. `install --allow-approve` registers `answer_permission` and `answer_question`. With both flags the registered methods are `list_sessions`, `get_session`, `continue_command`, `rename_session`, `cleanup_desk`, `send_followup`, `queue_status`, `new_session`, `continue_session`, `stop_session`, and `list_pending`.
+`install --allow-send` registers `send_followup` and `queue_status`. `install --allow-launch` registers `new_session`, `continue_session`, and `stop_session`. `install --allow-approve` registers `answer_permission` and `answer_question`. With both flags the registered methods are `list_sessions`, `get_session`, `continue_command`, `rename_session`, `cleanup_desk`, `wait_session`, `send_followup`, `queue_status`, `new_session`, `continue_session`, `stop_session`, and `list_pending`.
 
 `deliver_message` is not part of either install flag. `install` never sets `CLAUDE_REMOTE_ALLOW_DELIVER`, so it is only registered when you export it yourself for a foreground `http`.
 
@@ -291,6 +306,60 @@ These are the method names.
 A background session uses `state`. `status.source` is `agents-json` when the value came from that command. Only `kind`, `pid`, `sessionId`, `id`, `status`, `state`, and `waitingFor` are kept from its output; `cwd` and `name` are dropped. When the command is missing, fails, times out, or prints something that is not a JSON array (an older CLI), the server falls back: a live session uses the `status` token in `~/.claude/sessions/<pid>.json` mapped the same way (`source: sessions-file`), and anything else uses the run state (`source: fallback`). `CLAUDE_REMOTE_AGENTS_JSON=0` turns the command off. The `stuck` line in `get_session` follows `status` when it came from `agents-json`, and keeps the transcript-tail heuristic otherwise. The `observedStatus` field on a `handed` send uses the same values.
 
 While a process is live, `process` carries what `claude agents --json` does not: `entrypoint` (`desktop`, `terminal`, `other`), `tmux`, `bridgeSessionId`, and `messagingSocketPath`, read from `~/.claude/sessions/<pid>.json`.
+
+## Brief answers
+
+The caller is usually a language model that pays for every character of every tool definition and tool answer, again on each later turn of its conversation. So answers are brief by default: they carry the verdict, the final text, what needs an answer, and the checkout state, and leave out nulls, empty lists, fixed notices, and ids the caller already has.
+
+| Tool | Brief answer |
+| --- | --- |
+| `get_session` | `phase`, `title` or `prompt` (160 characters), `project`, `reply`, `toolCalls`, `toolErrors`, `pending`, `git`. `reason` only for `interrupted`, `failed`, `stopped`, `unknown`, or a `needs-input` with nothing listed. `lastSteps` (3) after a turn that did not end well. |
+| `wait_session` | The same without title, project, and prompt. While working: `{"phase":"working","timedOut":true,"toolCalls":12,"now":"Bash: npm test"}`. |
+| `list_sessions` | `id`, `title`, `project`, `status`, `branch`, `at` (last activity to the minute), `pending` (a count). 10 rows unless `limit` says otherwise; `more` is how many were left out. |
+| `send_followup` | `disposition`, plus `result` for `sent`, a `reason` or `code` when nothing was delivered, and `next: "wait_session"` for `started` and `handed`. |
+| `new_session` | With a `prompt`: the session id and the `wait_session` view, because the call waits for the run itself. Otherwise the launch result without nulls. |
+| `answer_permission`, `answer_question` | `answer`, then the `wait_session` view: after answering, the call waits for what the session does next. |
+| `list_pending` | `requestId`, `sessionId`, `kind`, `text` or `questions`, and `local: true` when only the machine can answer. |
+
+`reply` is clipped to 4000 characters (`CLAUDE_REMOTE_REPLY_CHARS`, up to 8000) and `replyTruncated` says when. `pending` entries that already have their answer are left out. `git` leaves out zero counts, so `{"branch":"main","head":"51d7139","pushed":true}` means nothing to commit and nothing to push.
+
+`get_session`, `wait_session`, and `list_sessions` take `detail: "full"` for the complete records described in the sections below. `CLAUDE_REMOTE_DETAIL=full` (`install --full-detail`) makes that the default for every tool and turns off the waiting inside `new_session` and the answer tools.
+
+Three settings reduce it further:
+
+- `install --core-tools` (`CLAUDE_REMOTE_TOOLS=core`) registers only `list_sessions`, `get_session`, `wait_session`, `send_followup`, `new_session`, `stop_session`, `list_pending`, `answer_permission`, and `answer_question`. Every registered tool's definition is sent to the model with each of its turns.
+- `install --call-timeout=95` lets one `wait_session`, `new_session`, or answer call block for up to 90 seconds instead of 25, so a long task needs fewer calls. Use it only when the client waits that long for a tool call.
+- `--notify-url` removes waiting calls altogether for a client that can be woken by a webhook; see the end of [Waiting for a session](#waiting-for-a-session).
+
+## Waiting for a session
+
+The field names in this section are those of `detail: "full"`.
+
+`get_session` answers "what is this session doing" with one field, `phase`, and `wait_session` blocks until that changes, so a client does not have to poll or interpret several status fields.
+
+| `phase.value` | Meaning | What to read |
+| --- | --- | --- |
+| `working` | A turn is in progress, or a run this server started has not exited. | `turn.narration`, `turn.steps` |
+| `needs-input` | A permission request or question is waiting. | `card.pending`, then `answer_permission` or `answer_question` |
+| `done` | The newest turn ended with a reply, or the run exited cleanly. | `turn.reply`, `run.result.text`, `git` |
+| `failed` | The run ended in an error, or a background session failed. | `run.result`, `turn.steps` |
+| `interrupted` | The newest turn has no final reply and the process is idle or gone. | `turn.steps` |
+| `stopped` | The run was ended by a signal, for example by `stop_session`. | `turn.steps` |
+| `idle`, `unknown` | Nothing to report, or not enough to tell. | `phase.reason` |
+
+`turn` is read from the whole transcript: the newest prompt, its final `reply` (null until there is one), the newest `narration` written between tool calls, `toolCalls`, `toolErrors`, `openTools`, and the last 15 `steps` with each tool's main argument and `outcome` (`ok`, `error`, `running`). The first 200 characters of each tool result are included only when the helper runs with `CLAUDE_REMOTE_STEP_RESULTS=1` (`install --step-results`), because tool output can hold secrets. `lastReply` is still the newest assistant text in the file, which can belong to an earlier turn; it skips the `No response requested.` filler.
+
+`run` describes the newest `claude` child this server started for the session: a `new_session` with a `prompt`, or a `send_followup` that resumed a closed session. The server reads that child's stream to the end and keeps its last record: `result.text`, `isError`, `subtype`, `numTurns`, `durationMs`, and `permissionDenials` (the tool calls nobody approved), with the exit code. Records live in `~/.claude-remote/runs/<sessionId>.json` (mode `0600`) and survive a helper restart. A run that was still going when the helper restarted reads as `lost`, because nothing is reading its output any more. `uninstall --purge` removes the directory.
+
+`git` is `git status --porcelain=v2 --branch` in the session's folder at call time: `branch`, `head`, `upstream`, `ahead`, `behind`, `dirtyFiles`, and `pushed` (true when the branch has an upstream and nothing to push). It lets a client check "committed and pushed" against the checkout instead of the session's own words. It is null outside a git checkout and in the macOS protected folders.
+
+`wait_session` takes `sessionId` and `timeoutMs` (default and maximum 25000, always 5 seconds under the call deadline). It returns at once when the session is not working. Otherwise it re-reads the session when a hook event, a run exit, or a new prompt arrives for it, and every two seconds. `timedOut: true` means call it again. `next` says in a sentence what to do.
+
+`send_followup` on a closed session returns `sent` with the result when the resumed run ends within 20 seconds (`CLAUDE_REMOTE_SEND_INLINE_MS`). A longer run, or one that stops to ask for a permission, returns `started` and keeps going; `wait_session` reports what it needs and how it ends. Before this, a resume that took longer than the 30-second call deadline came back as `deadline exceeded`, and one that printed more than 2 MB of stream output was killed.
+
+A typical loop: `new_session` with a `prompt` (or `send_followup`), then `wait_session` until `timedOut` is false. On `needs-input`, answer and wait again. On `done`, read `run.result.text` and `git`.
+
+With `--notify-url`, the helper also POSTs `{"type":"claude-remote.session","event":"turn-finished"|"turn-failed"|"run-finished",...}` when a `Stop` or `StopFailure` hook arrives or a run it started exits, signed like the pending alerts and with no transcript text. `run-finished` carries `exitCode` and `isError`.
 
 ## Sub-sessions
 
@@ -384,7 +453,7 @@ The server does not pass permission-bypass flags. That includes `--dangerously-s
 
 `list_sessions` does not stat or resolve a working directory under Desktop, Documents, Downloads, `Library/Mobile Documents`, or `Library/CloudStorage`. Those are the macOS protected folders, including iCloud.
 
-Each `tools/call` has a deadline. The default is 30 seconds. `CLAUDE_REMOTE_CALL_TIMEOUT_MS` can set it from 200 to 60000. On expiry the listener returns one JSON body, JSON-RPC code `-32000`, message `deadline exceeded`.
+Each `tools/call` has a deadline. The default is 30 seconds. `CLAUDE_REMOTE_CALL_TIMEOUT_MS` (`install --call-timeout=<seconds>`, 10 to 95) can set it from 200 to 95000; the ceiling stays under the 100 second read timeout of a Cloudflare tunnel. On expiry the listener returns one JSON body, JSON-RPC code `-32000`, message `deadline exceeded`.
 
 ## Uninstall
 
