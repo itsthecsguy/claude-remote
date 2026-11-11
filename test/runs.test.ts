@@ -228,8 +228,9 @@ test("a headless launch keeps reading the stream and records how the run ended",
     assert.equal(run?.result?.numTurns, 12);
     assert.deepEqual(run?.result?.permissionDenials, [{ tool: "Bash", input: "git push" }]);
     assert.equal(logs.includes("All four steps"), false, "the result text is never logged");
-    const saved = JSON.parse(await readFile(path.join(runsRoot(home), `${id}.json`), "utf8")) as RunRecord;
-    assert.equal(saved.state, "exited");
+    // The record is marked exited in memory first and written to disk a moment later.
+    const savedState = async (): Promise<string> => (JSON.parse(await readFile(path.join(runsRoot(home), `${id}.json`), "utf8")) as RunRecord).state;
+    await until(async () => (await savedState()) === "exited");
   } finally {
     if (previous == null) delete process.env.FAKE_CLAUDE_SESSION;
     else process.env.FAKE_CLAUDE_SESSION = previous;
