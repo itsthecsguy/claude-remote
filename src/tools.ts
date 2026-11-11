@@ -478,7 +478,7 @@ const STILL_RUNNING = Symbol("still-running");
 
 /**
  * The delivery if it settles within the inline wait, otherwise STILL_RUNNING. A rejection passes
- * through. A permission request or question from the resumed session ends the wait at once: the
+ * through. A permission request or question from the resumed session, new or already listed, ends the wait at once: the
  * caller is the one who has to answer it, and cannot while this call is still open.
  */
 function withinInline<T>(delivery: Promise<T>, ms: number, sessionId: string): Promise<T | typeof STILL_RUNNING> {
@@ -496,6 +496,11 @@ function withinInline<T>(delivery: Promise<T>, ms: number, sessionId: string): P
       stop();
       resolve(STILL_RUNNING);
     });
+    // A request that arrived before this subscription would otherwise be waited out.
+    if (pendingStore.list({ sessionId }).some((view) => view.kind !== "notification" && !view.answered)) {
+      stop();
+      resolve(STILL_RUNNING);
+    }
     delivery.then(
       (value) => {
         stop();

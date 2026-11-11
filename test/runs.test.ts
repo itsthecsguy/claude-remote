@@ -267,7 +267,8 @@ test("a follow-up that outlives the inline wait returns started, keeps running, 
   assert.ok(done.waitedMs < 5000);
 });
 
-test("a follow-up that asks for a permission returns started right away, so the caller can answer it", async (t) => {
+// 0 ms: the request is listed before the inline wait subscribes, as on a slow machine. 200 ms: it arrives during the wait.
+for (const delayMs of [0, 200]) test(`a follow-up that asks for a permission ${delayMs === 0 ? "before the inline wait starts" : "during the inline wait"} returns started, so the caller can answer it`, async (t) => {
   const project = await tempDir("claude-remote-proj-");
   const { home, root } = await tempHome();
   const id = "d6666666-6666-4666-8666-666666666666";
@@ -284,13 +285,12 @@ test("a follow-up that asks for a permission returns started right away, so the 
     else process.env.CLAUDE_REMOTE_FAKE_AGENTS = previous;
   });
   const config = { ...configAt(home, root, { allowSend: true }), sendInlineMs: 20_000 };
-  const at = Date.now();
   setTimeout(() => {
     pendingStore.record({ hook_event_name: "PermissionRequest", session_id: id, cwd: project, tool_name: "Bash", tool_input: { command: "git push" } }, { allowApprove: true, waitMs: 60_000 });
-  }, 200);
+  }, delayMs);
   const outcome = await sendFollowup(config, { sessionId: id, message: "push it", confirm: true });
   assert.equal(outcome.disposition, "started");
-  assert.ok(Date.now() - at < 1400, "ended by the permission request, not by the run or the 20 s inline wait");
+  // sent would mean the 3 s run ended first. How long the call took depends on the machine, so it is not asserted.
   const asked = await waitSession(config, { sessionId: id, timeoutMs: 5000 }, { pollMs: 50 });
   assert.equal(asked.phase.value, "needs-input");
   assert.equal(asked.pending[0]?.toolInput?.command, "git push");
