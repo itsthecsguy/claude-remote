@@ -116,7 +116,7 @@ export function phaseOf(input: {
  * A run record speaks for the session only while it is the newest thing in it. Once a later prompt
  * has started a turn (someone continued the session in a terminal), the transcript decides again.
  */
-function currentRun(owned: RunRecord | null, turn: TurnFacts | null): RunRecord | null {
+export function currentRun(owned: RunRecord | null, turn: TurnFacts | null): RunRecord | null {
   if (!owned || owned.state === "lost") return null;
   if (owned.state === "running" || !owned.endedAt || !turn?.startedAt) return owned;
   return Date.parse(turn.startedAt) > Date.parse(owned.endedAt) ? null : owned;

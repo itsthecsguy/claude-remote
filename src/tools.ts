@@ -18,7 +18,7 @@ import {
   offerChannel,
 } from "./channel.js";
 import { classifyLiveOwner, continueCommandLine, liveWriterWarning } from "./continue.js";
-import type { Config } from "./config.js";
+import { MAX_CALL_TIMEOUT_MS, type Config } from "./config.js";
 import type { LiveOwner, ProcessDetailsView, SessionCard, SessionDetail, SessionRegistry, SessionStatus, SubSessionRow, TailEnd, WorktreeLaunch } from "./domain.js";
 import { DeskError, assertNever } from "./domain.js";
 import type { GitFacts, TurnFacts, WaitResult } from "./domain.js";
@@ -51,6 +51,7 @@ import { loadLiveRecords, loadSessionRegistry, observedRegistryStatus, processId
 import { readTranscript, type TranscriptFacts } from "./read.js";
 import { classifyRunState, listCmdlines, runStateEvidence, tailFlag } from "./running.js";
 import { phaseOf, summarize } from "./summary.js";
+import { briefList, briefSend, briefSession, type BriefSession } from "./brief.js";
 import { loadAgents, resolveStatus, statusFromEntry, statusFromToken, type AgentsLoader, type AgentsSnapshot } from "./agents.js";
 import { listSubSessions } from "./subagents.js";
 
@@ -88,15 +89,15 @@ export function defaultAgentsLoader(config: Config): AgentsLoader {
   return async () => loadAgents(config.claudeBin, { disabled: !config.agentsJson, env: await claudeChildEnv(config) });
 }
 
-const LIST_DESCRIPTION = "List local coding sessions. Each row has the sidebar title when the session is joined, otherwise the transcript title, the project name, cwd as the recorded working folder, run state, status, liveOwner, the continue command, and the live-owner warning. status.value comes from claude agents --json: busy is working, waiting is needs-you with waitingFor, idle is idle, and a background session uses its state (working, blocked as needs-you, done as idle, failed, stopped). A session agents --json does not list is not-running. When that command is missing or fails, status falls back to the sessions/<pid>.json token and status.source says so. process carries entrypoint, tmux, bridgeSessionId, and messagingSocketPath from sessions/<pid>.json while the process is live. subSessions lists subagent transcripts under the session (agentType, isFork, spawnDepth, finished, size, last write) from file stats and .meta.json only, up to 20 per row; subSessionCount is the total. pending lists what the session is waiting on when the claude-remote hooks are installed: the permission request (tool name and input summary), the AskUserQuestion text and options, or the notification message, with a requestId and answerable (see list_pending, answer_permission, answer_question). A session with no transcript yet is included when sessions/<pid>.json names it and that pid is alive with a matching procStart, or when its channel socket accepts a connection. liveOwner is desktop, terminal, none, or unknown. cwd is not the encoded project directory name. The page has no transcript text. A running state with evidence sessions-file means the registry file is live. If the start time cannot be checked, the state is unknown. finished means there is no live marker and the tail is closed. It does not mean the coding task succeeded. Transcript rows are paged by file mtime. Live sessions that have no transcript are added after that page.";
+const LIST_DESCRIPTION = "List local Claude Code sessions, newest first: id, title, project, status (working, needs-you, idle, not-running, failed, stopped, unknown), branch, last activity, and the number of pending requests. limit defaults to 10. detail full returns every recorded field per row (cwd, run state, process, subagents, the continue command) and defaults to 50 rows.";
 
-const GET_DESCRIPTION = "Read one local coding session. Read phase first: phase.value is working, needs-input (answer card.pending), done (turn.reply is the final answer to turn.prompt), interrupted (the turn stopped with no final reply), failed, stopped, idle, or unknown, and phase.reason says why. To wait for a change instead of polling, call wait_session. turn describes the newest prompt from the whole transcript: prompt, reply (null until the turn has replied), narration (the newest text written between tool calls), toolCalls, toolErrors, openTools, and steps, the newest tool calls with their main argument, outcome (ok, error, running), and the start of each result. The start of each step result is empty unless the server runs with CLAUDE_REMOTE_STEP_RESULTS=1. run is the newest claude child this server started for the session (new_session with a prompt, or a send_followup that resumed it): its state, exit code, and the final result record with text, isError, numTurns, and permissionDenials. git is the checkout read at call time: branch, head, upstream, ahead, behind, dirtyFiles, and pushed. lastReply is the newest assistant text in the file and can belong to an earlier turn or to the middle of this one. Also returns recent tail turns and a short extractive summary. card.pending carries the question, permission request, or notification text the hooks reported, as in list_sessions. The stuck line is session is running, a tool error, a tool call with no result, or waiting on a reply. The first match wins.";
+const GET_DESCRIPTION = "Read one session. phase is working, needs-input (answer what pending lists), done (reply is the final text), interrupted (the turn stopped with no final reply), failed, stopped, idle, or unknown. Also returns the title, the prompt, tool-call counts, pending requests, and git (branch, head, ahead, dirty, pushed) read at call time. To wait for a change, call wait_session. detail full adds the turn list, every step, the run record, and the session card.";
 
-const SEND_DESCRIPTION = `Send a follow-up for a local coding session. Requires confirm set to true. mode defaults to queue. When no live process owns the session and no channel listener is bound, queue spawns the local claude CLI in the session directory and returns sent with the result when that run ends within about 20 seconds; a longer run, or one that stops to ask for a permission or an answer, returns started and keeps going, and wait_session reports what it needs and how it ends. When a live process owns it, or a channel listener accepts, queue hands the message to that listener and does not resume. With no listener the result is undelivered and nothing is stored for a later resume. A listener that rejects the frame returns rejected and does not resume. steer returns unsupported and does not signal a live process. Optional attachments are inline base64 or a path under ~/.claude-remote/inbox. Copies land in ~/.claude-remote/attachments only when a delivery will actually happen, and the prompt names those paths. File bytes are not logged. Does not pass a permission-bypass flag. ${DESKTOP_NOTICE}`;
+const SEND_DESCRIPTION = "Send a message to a session. confirm must be true. A closed session is resumed with the local claude CLI, outside the desktop app window: sent carries the result when the run ends within about 20 seconds, and started means it is still running or needs an answer, so call wait_session. A live session gets the message through its channel listener (handed); without one the result is queued, undelivered, or rejected with a reason, and nothing is resumed under a live process. mode steer is unsupported. attachments are inline base64 or a path under ~/.claude-remote/inbox. No permission-bypass flag is passed.";
 
 const QUEUE_DESCRIPTION = "Show follow-up tickets for one session. Tickets do not include the message text. Set deliver to true and confirm to true to resume queued tickets once this server is the only writer. A live process leaves them queued.";
 
-const CONTINUE_DESCRIPTION = "Return the shell command that continues this session in a terminal. The command is text and this tool does not run it. The id is the transcript UUID. cwd is shell-quoted. A linked worktree uses the same directory a resume spawn would use. The command includes --dangerously-load-development-channels server:claude-remote-channel so a later send can reach that terminal. That flag bypasses the channel allowlist. If a live process owns the session, warning is set and liveOwner is desktop, terminal, or unknown. Stop that process before running the command.";
+const CONTINUE_DESCRIPTION = "Return the shell command that continues this session in a terminal. The command is not run. warning is set when a live process owns the session; stop that process first.";
 
 const RENAME_DESCRIPTION = "Report that no documented route sets a session title through this server. This does not edit transcript files.";
 
@@ -521,7 +522,7 @@ async function gitFor(config: Config, cwd: string | null): Promise<GitFacts | nu
 
 const WAIT_POLL_MS = 2000;
 
-const WAIT_DESCRIPTION = "Block until a session stops working, or until timeoutMs passes (default and maximum 25000; the server caps it below its call deadline). Use it after new_session with a prompt, after send_followup returns started or handed, and after answering a prompt. Returns phase, status, turn (prompt, reply, narration, steps), run (the final result record of a run this server started: text, isError, numTurns, permissionDenials, and the exit code), pending, git (branch, head, ahead, behind, dirtyFiles, pushed), timedOut, and next, which says what to do. timedOut true with phase working means call wait_session again. It returns at once when the session is not working.";
+const WAIT_DESCRIPTION = "Block until a session stops working or timeoutMs passes (default and maximum: the server wait limit, 25000 unless configured). Returns the same view as get_session without the title and prompt. timedOut true means it is still working: call again. Use it after new_session, after send_followup returns started or handed, and after an answer.";
 
 /**
  * Long-poll one session. It re-reads the session when a hook event, a run exit, or a new prompt
@@ -613,6 +614,59 @@ function nextStep(detail: SessionDetail, timedOut: boolean): string {
   }
 }
 
+const DETAIL = z.enum(["brief", "full"]).optional();
+const BRIEF_LIST_ROWS = 10;
+/** Tools a remote caller does not need to run and watch sessions. CLAUDE_REMOTE_TOOLS=core leaves them out. */
+const core = (config: Config): boolean => config.toolset === "core";
+
+export function briefDetail(config: Config, detail: SessionDetail): BriefSession {
+  return briefSession(
+    { phase: detail.phase, turn: detail.turn, run: detail.run, git: detail.git, pending: detail.card.pending ?? [], title: detail.card.title, project: detail.card.projectName },
+    { replyChars: config.replyChars, identity: true },
+  );
+}
+
+export function briefWait(config: Config, result: WaitResult): BriefSession {
+  return briefSession(result, { replyChars: config.replyChars, timedOut: result.timedOut });
+}
+
+const ANSWER_SETTLE_MS = 1000;
+
+/**
+ * What an answer tool does after it has answered, in brief mode: give the session a moment to pick
+ * the answer up, then wait as wait_session does, so the caller needs no second call.
+ */
+export function answerFollow(config: Config): ((sessionId: string) => Promise<BriefSession>) | undefined {
+  if (config.detail !== "brief") return undefined;
+  return async (sessionId) => {
+    await new Promise((resolve) => setTimeout(resolve, ANSWER_SETTLE_MS));
+    const budget = Math.max(0, config.waitMaxMs - ANSWER_SETTLE_MS - 1000);
+    return briefWait(config, await waitSession(config, { sessionId, timeoutMs: budget }));
+  };
+}
+
+/**
+ * What new_session does after a headless start, in brief mode: wait for the run inside the same
+ * call. The transcript file can be a moment behind the init event, so a session that cannot be
+ * read yet counts as still working.
+ */
+export function launchFollow(config: Config): ((sessionId: string, elapsedMs: number) => Promise<BriefSession>) | undefined {
+  if (config.detail !== "brief") return undefined;
+  return async (sessionId, elapsedMs) => {
+    const deadline = Date.now() + Math.max(0, config.waitMaxMs - elapsedMs - 1000);
+    for (;;) {
+      try {
+        return briefWait(config, await waitSession(config, { sessionId, timeoutMs: Math.max(0, deadline - Date.now()) }));
+      } catch (error) {
+        if (!(error instanceof DeskError) || error.code !== "not-found" || Date.now() + 500 >= deadline) {
+          return { phase: "working", timedOut: true };
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+  };
+}
+
 export function registerTools(server: McpServer, config: Config): void {
   server.registerTool(
     "list_sessions",
@@ -621,12 +675,14 @@ export function registerTools(server: McpServer, config: Config): void {
       inputSchema: z.object({
         project: z.string().optional(),
         limit: z.number().int().min(1).max(200).optional(),
+        detail: DETAIL,
       }),
     },
     async (args) => {
       try {
-        const result = await listSessions(config, args);
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        const brief = (args.detail ?? config.detail) === "brief";
+        const result = await listSessions(config, { project: args.project, limit: args.limit ?? (brief ? BRIEF_LIST_ROWS : undefined) });
+        return { content: [{ type: "text", text: JSON.stringify(brief ? briefList(result.sessions, result.scannedFileCount) : result) }] };
       } catch (error) {
         return toolError(error);
       }
@@ -638,18 +694,20 @@ export function registerTools(server: McpServer, config: Config): void {
       description: GET_DESCRIPTION,
       inputSchema: z.object({
         sessionId: z.string(),
+        detail: DETAIL,
       }),
     },
     async (args) => {
       try {
-        const result = await getSession(config, args);
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        const result = await getSession(config, { sessionId: args.sessionId });
+        const brief = (args.detail ?? config.detail) === "brief";
+        return { content: [{ type: "text", text: JSON.stringify(brief ? briefDetail(config, result) : result) }] };
       } catch (error) {
         return toolError(error);
       }
     },
   );
-  server.registerTool(
+  if (!core(config)) server.registerTool(
     "continue_command",
     {
       description: CONTINUE_DESCRIPTION,
@@ -666,7 +724,7 @@ export function registerTools(server: McpServer, config: Config): void {
       }
     },
   );
-  server.registerTool(
+  if (!core(config)) server.registerTool(
     "rename_session",
     {
       description: RENAME_DESCRIPTION,
@@ -677,7 +735,7 @@ export function registerTools(server: McpServer, config: Config): void {
     },
     async () => toolError(new DeskError("no-documented-route", RENAME_MESSAGE)),
   );
-  server.registerTool(
+  if (!core(config)) server.registerTool(
     "cleanup_desk",
     {
       description: "Delete channel socket and token files that are not accepting connections, and delete expired attachment directories. Does not delete key files.",
@@ -698,13 +756,15 @@ export function registerTools(server: McpServer, config: Config): void {
       description: WAIT_DESCRIPTION,
       inputSchema: z.object({
         sessionId: z.string(),
-        timeoutMs: z.number().int().min(0).max(60000).optional(),
+        timeoutMs: z.number().int().min(0).max(MAX_CALL_TIMEOUT_MS).optional(),
+        detail: DETAIL,
       }),
     },
     async (args) => {
       try {
-        const result = await waitSession(config, args);
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        const result = await waitSession(config, { sessionId: args.sessionId, timeoutMs: args.timeoutMs });
+        const brief = (args.detail ?? config.detail) === "brief";
+        return { content: [{ type: "text", text: JSON.stringify(brief ? briefWait(config, result) : result) }] };
       } catch (error) {
         return toolError(error);
       }
@@ -720,13 +780,14 @@ export function registerTools(server: McpServer, config: Config): void {
     async (args) => {
       try {
         const result = await sendFollowup(config, args);
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        const view = config.detail === "brief" ? briefSend(result, args.sessionId, config.replyChars) : result;
+        return { content: [{ type: "text", text: JSON.stringify(view) }] };
       } catch (error) {
         return toolError(error);
       }
     },
   );
-  server.registerTool(
+  if (!core(config)) server.registerTool(
     "queue_status",
     {
       description: QUEUE_DESCRIPTION,

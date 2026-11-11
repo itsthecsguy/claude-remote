@@ -32,16 +32,25 @@ export type Config = {
   waitMaxMs: number;
   /** Whether get_session and wait_session include the start of each tool result in turn.steps. */
   stepResults: boolean;
+  /** brief answers carry only what a remote caller acts on. full returns every record, as before. */
+  detail: "brief" | "full";
+  /** The longest final text a brief answer carries. */
+  replyChars: number;
+  /** core registers only the tools a remote caller needs to run and watch sessions. */
+  toolset: "all" | "core";
 };
 
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 
-/** The deadline for one tools/call, from CLAUDE_REMOTE_CALL_TIMEOUT_MS (200 to 60000). */
+/** Above this a request can outlive the 100 second read timeout of a Cloudflare tunnel. */
+export const MAX_CALL_TIMEOUT_MS = 95_000;
+
+/** The deadline for one tools/call, from CLAUDE_REMOTE_CALL_TIMEOUT_MS (200 to 95000). */
 export function callTimeoutFrom(env: NodeJS.ProcessEnv): number {
   const raw = env.CLAUDE_REMOTE_CALL_TIMEOUT_MS;
   if (!raw) return DEFAULT_CALL_TIMEOUT_MS;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 200 || parsed > 60_000) return DEFAULT_CALL_TIMEOUT_MS;
+  if (!Number.isFinite(parsed) || parsed < 200 || parsed > MAX_CALL_TIMEOUT_MS) return DEFAULT_CALL_TIMEOUT_MS;
   return parsed;
 }
 
@@ -78,6 +87,7 @@ const PLATFORMS = new Set<NodeJS.Platform>([
 ]);
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_REPLY_CHARS = 4000;
 const DEFAULT_LAUNCH_WAIT_MS = 8000;
 const HARD_LAUNCH_WAIT_MS = 60_000;
 const DEFAULT_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -133,6 +143,9 @@ export function parseConfig(
     sendInlineMs: insideDeadline(env, env.CLAUDE_REMOTE_SEND_INLINE_MS, 0.8),
     waitMaxMs: insideDeadline(env, env.CLAUDE_REMOTE_WAIT_MAX_MS, 1),
     stepResults: env.CLAUDE_REMOTE_STEP_RESULTS === "1",
+    detail: env.CLAUDE_REMOTE_DETAIL === "full" ? "full" : "brief",
+    replyChars: bounded(env.CLAUDE_REMOTE_REPLY_CHARS, DEFAULT_REPLY_CHARS, 8000),
+    toolset: env.CLAUDE_REMOTE_TOOLS === "core" ? "core" : "all",
   };
 }
 

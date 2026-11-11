@@ -6,8 +6,8 @@ import { isDeskCommand, runCli, USAGE } from "./cli.js";
 import { parseConfig } from "./config.js";
 import { registerDeliverTool } from "./deliver.js";
 import { registerLaunchTools } from "./launch.js";
-import { registerPendingTools } from "./pending.js";
-import { registerTools } from "./tools.js";
+import { pendingStore, registerPendingTools } from "./pending.js";
+import { answerFollow, launchFollow, registerTools } from "./tools.js";
 
 const command = process.argv[2];
 if (command === "channel") {
@@ -36,8 +36,8 @@ const config = parseConfig(process.env);
 serveStdio(() => {
   const server = new McpServer({ name: "claude-remote", version: "0.1.0" });
   registerTools(server, config);
-  registerLaunchTools(server, config);
+  registerLaunchTools(server, config, launchFollow(config));
   registerDeliverTool(server, config);
-  registerPendingTools(server, config);
+  registerPendingTools(server, config, pendingStore, answerFollow(config));
   return server;
 });

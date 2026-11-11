@@ -138,13 +138,13 @@ test("a helper restart keeps pending entries, and none of them is answerable", a
     assert.equal(reply.wait, true);
     await post(port, token, "/hook/event", { session_id: SESSION, hook_event_name: "Notification", notification_type: "idle_prompt", message: "waiting" });
     const live = await listPending(port, token);
-    assert.equal(live.find((entry) => entry.requestId === reply.requestId)?.answerable, true, "answerable before the restart");
+    assert.equal(live.find((entry) => entry.requestId === reply.requestId)?.local, undefined, "answerable before the restart");
     await stopHelper(helper);
     assert.equal((await stat(pendingFilePath(home))).mode & 0o777, 0o600);
     helper = await startHelper(env);
     const after = await listPending(port, token);
     assert.deepEqual(after.map((entry) => entry.kind).sort(), ["notification", "permission"]);
-    assert.ok(after.every((entry) => entry.answerable === false));
+    assert.equal(after.find((entry) => entry.kind === "permission")?.local, true, "a restored request can only be answered on the machine");
     const answer = await mcpCall(port, token, "answer_permission", { sessionId: SESSION, requestId: reply.requestId, decision: "allow", confirm: true });
     assert.equal(answer.isError, true);
     assert.match(answer.text, /no hook is waiting/);
@@ -186,9 +186,9 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-async function listPending(port: number, token: string): Promise<Array<{ requestId: string; kind: string; answerable: boolean }>> {
+async function listPending(port: number, token: string): Promise<Array<{ requestId: string; kind: string; local?: boolean }>> {
   const result = await mcpCall(port, token, "list_pending", { sessionId: SESSION });
-  return (JSON.parse(result.text) as { pending: Array<{ requestId: string; kind: string; answerable: boolean }> }).pending;
+  return (JSON.parse(result.text) as { pending: Array<{ requestId: string; kind: string; local?: boolean }> }).pending;
 }
 
 async function mcpCall(port: number, token: string, name: string, args: Record<string, unknown>): Promise<{ isError: boolean; text: string }> {

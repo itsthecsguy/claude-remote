@@ -1,4 +1,4 @@
-import { approveTimeoutSeconds, MAX_APPROVE_TIMEOUT_S, parseConfig, type Config } from "./config.js";
+import { approveTimeoutSeconds, MAX_APPROVE_TIMEOUT_S, MAX_CALL_TIMEOUT_MS, parseConfig, type Config } from "./config.js";
 import { cleanupDesk } from "./cleanup.js";
 import { DeskError, assertNever } from "./domain.js";
 import { listenHttp, resolveHttpPort, HTTP_HOST } from "./http.js";
@@ -46,7 +46,7 @@ type Parsed =
   | { command: "stop"; json: boolean; sessionId?: string; target?: string }
   | { command: "cleanup"; json: boolean }
   | { command: "http"; port?: number }
-  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; stepResults: boolean; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags; tunnel: TunnelFlags; watchdog: boolean; watchdogIntervalS?: number }
+  | { command: "install"; json: boolean; dryRun: boolean; allowSend: boolean; allowLaunch: boolean; allowApprove: boolean; stepResults: boolean; coreTools: boolean; callTimeoutS?: number; approveTimeoutS?: number; hooks: boolean; port?: number; notify: NotifyFlags; tunnel: TunnelFlags; watchdog: boolean; watchdogIntervalS?: number }
   | { command: "uninstall"; json: boolean; dryRun: boolean; purge: boolean }
   | { command: "status"; json: boolean; probe: boolean }
   | { command: "rotate-token"; json: boolean }
@@ -175,6 +175,8 @@ async function dispatch(config: Config, parsed: Parsed, io: Io, env: NodeJS.Proc
         allowLaunch: parsed.allowLaunch,
         allowApprove: parsed.allowApprove,
         stepResults: parsed.stepResults,
+        coreTools: parsed.coreTools,
+        callTimeoutS: parsed.callTimeoutS,
         approveTimeoutS: parsed.approveTimeoutS ?? approveTimeoutSeconds(env.CLAUDE_REMOTE_APPROVE_TIMEOUT_S),
         hooks: parsed.hooks,
         notify: notifyInput(parsed.notify, env),
@@ -416,6 +418,8 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
   let allowLaunch = false;
   let allowApprove = false;
   let stepResults = false;
+  let coreTools = false;
+  let callTimeoutS: number | undefined;
   let approveTimeoutS: number | undefined;
   let hooks = true;
   let purge = false;
@@ -440,6 +444,8 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     else if (token === "--allow-launch") allowLaunch = true;
     else if (token === "--allow-approve" && command === "install") allowApprove = true;
     else if (token === "--step-results" && command === "install") stepResults = true;
+    else if (token === "--core-tools" && command === "install") coreTools = true;
+    else if (token.startsWith("--call-timeout=") && command === "install") callTimeoutS = parseCallTimeout(token.slice("--call-timeout=".length));
     else if (token === "--no-hooks" && command === "install") hooks = false;
     else if (token === "--no-watchdog" && command === "install") watchdog = false;
     else if (token.startsWith("--watchdog-interval=") && command === "install") watchdogIntervalS = parseWatchdogInterval(token.slice("--watchdog-interval=".length));
@@ -456,7 +462,7 @@ function parseRemote(command: "http" | "install" | "uninstall" | "status" | "rot
     case "install":
       if (purge) throw new DeskError("usage", USAGE);
       if (!notify.url && (notify.secret || notify.auth || notify.includeText || notify.cleared)) throw new DeskError("usage", USAGE);
-      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, stepResults, approveTimeoutS, hooks, port, notify, tunnel, watchdog, watchdogIntervalS };
+      return { command, json, dryRun, allowSend, allowLaunch, allowApprove, stepResults, coreTools, callTimeoutS, approveTimeoutS, hooks, port, notify, tunnel, watchdog, watchdogIntervalS };
     case "uninstall":
       if (allowSend || allowLaunch || port != null) throw new DeskError("usage", USAGE);
       return { command, json, dryRun, purge };
@@ -525,6 +531,13 @@ function notifyInput(flags: NotifyFlags, env: NodeJS.ProcessEnv): InstallInput["
 function parseApproveTimeout(raw: string): number {
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 5 || parsed > MAX_APPROVE_TIMEOUT_S) throw new DeskError("usage", USAGE);
+  return parsed;
+}
+
+/** Seconds one tools/call may take, which also bounds how long wait_session can block. */
+function parseCallTimeout(raw: string): number {
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 10 || parsed * 1000 > MAX_CALL_TIMEOUT_MS) throw new DeskError("usage", USAGE);
   return parsed;
 }
 

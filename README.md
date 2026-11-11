@@ -47,7 +47,7 @@ node dist/index.js rotate-token
 node dist/index.js http
 ```
 
-`--step-results` sets `CLAUDE_REMOTE_STEP_RESULTS=1` for the helper; see [Waiting for a session](#waiting-for-a-session). `install` prints a `warning=quick-tunnel-url-changes` line when it sets up a quick tunnel.
+`--step-results` sets `CLAUDE_REMOTE_STEP_RESULTS=1` for the helper; see [Waiting for a session](#waiting-for-a-session). `--core-tools` and `--call-timeout=<seconds>` cut what a remote model has to read; see [Brief answers](#brief-answers). `install` prints a `warning=quick-tunnel-url-changes` line when it sets up a quick tunnel.
 
 `--tunnel=quick|named|token|funnel|none` picks how the helper is reached from outside (default `quick`); see [Stable endpoint](#stable-endpoint). `--no-watchdog` skips the watchdog agent and `--watchdog-interval=<seconds>` (30 to 3600, default 120) sets how often it runs; see [Watchdog](#watchdog).
 
@@ -295,7 +295,33 @@ A background session uses `state`. `status.source` is `agents-json` when the val
 
 While a process is live, `process` carries what `claude agents --json` does not: `entrypoint` (`desktop`, `terminal`, `other`), `tmux`, `bridgeSessionId`, and `messagingSocketPath`, read from `~/.claude/sessions/<pid>.json`.
 
+## Brief answers
+
+The caller is usually a language model that pays for every character of every tool definition and tool answer, again on each later turn of its conversation. So answers are brief by default: they carry the verdict, the final text, what needs an answer, and the checkout state, and leave out nulls, empty lists, fixed notices, and ids the caller already has.
+
+| Tool | Brief answer |
+| --- | --- |
+| `get_session` | `phase`, `title` or `prompt` (160 characters), `project`, `reply`, `toolCalls`, `toolErrors`, `pending`, `git`. `reason` only for `interrupted`, `failed`, `stopped`, `unknown`, or a `needs-input` with nothing listed. `lastSteps` (3) after a turn that did not end well. |
+| `wait_session` | The same without title, project, and prompt. While working: `{"phase":"working","timedOut":true,"toolCalls":12,"now":"Bash: npm test"}`. |
+| `list_sessions` | `id`, `title`, `project`, `status`, `branch`, `at` (last activity to the minute), `pending` (a count). 10 rows unless `limit` says otherwise; `more` is how many were left out. |
+| `send_followup` | `disposition`, plus `result` for `sent`, a `reason` or `code` when nothing was delivered, and `next: "wait_session"` for `started` and `handed`. |
+| `new_session` | With a `prompt`: the session id and the `wait_session` view, because the call waits for the run itself. Otherwise the launch result without nulls. |
+| `answer_permission`, `answer_question` | `answer`, then the `wait_session` view: after answering, the call waits for what the session does next. |
+| `list_pending` | `requestId`, `sessionId`, `kind`, `text` or `questions`, and `local: true` when only the machine can answer. |
+
+`reply` is clipped to 4000 characters (`CLAUDE_REMOTE_REPLY_CHARS`, up to 8000) and `replyTruncated` says when. `pending` entries that already have their answer are left out. `git` leaves out zero counts, so `{"branch":"main","head":"51d7139","pushed":true}` means nothing to commit and nothing to push.
+
+`get_session`, `wait_session`, and `list_sessions` take `detail: "full"` for the complete records described in the sections below. `CLAUDE_REMOTE_DETAIL=full` makes that the default for every tool and turns off the waiting inside `new_session` and the answer tools.
+
+Three settings reduce it further:
+
+- `install --core-tools` (`CLAUDE_REMOTE_TOOLS=core`) registers only `list_sessions`, `get_session`, `wait_session`, `send_followup`, `new_session`, `stop_session`, `list_pending`, `answer_permission`, and `answer_question`. Every registered tool's definition is sent to the model with each of its turns.
+- `install --call-timeout=95` lets one `wait_session`, `new_session`, or answer call block for up to 90 seconds instead of 25, so a long task needs fewer calls. Use it only when the client waits that long for a tool call.
+- `--notify-url` removes waiting calls altogether for a client that can be woken by a webhook; see the end of [Waiting for a session](#waiting-for-a-session).
+
 ## Waiting for a session
+
+The field names in this section are those of `detail: "full"`.
 
 `get_session` answers "what is this session doing" with one field, `phase`, and `wait_session` blocks until that changes, so a client does not have to poll or interpret several status fields.
 
@@ -415,7 +441,7 @@ The server does not pass permission-bypass flags. That includes `--dangerously-s
 
 `list_sessions` does not stat or resolve a working directory under Desktop, Documents, Downloads, `Library/Mobile Documents`, or `Library/CloudStorage`. Those are the macOS protected folders, including iCloud.
 
-Each `tools/call` has a deadline. The default is 30 seconds. `CLAUDE_REMOTE_CALL_TIMEOUT_MS` can set it from 200 to 60000. On expiry the listener returns one JSON body, JSON-RPC code `-32000`, message `deadline exceeded`.
+Each `tools/call` has a deadline. The default is 30 seconds. `CLAUDE_REMOTE_CALL_TIMEOUT_MS` (`install --call-timeout=<seconds>`, 10 to 95) can set it from 200 to 95000; the ceiling stays under the 100 second read timeout of a Cloudflare tunnel. On expiry the listener returns one JSON body, JSON-RPC code `-32000`, message `deadline exceeded`.
 
 ## Uninstall
 

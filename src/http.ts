@@ -22,7 +22,7 @@ import { logEvent } from "./log.js";
 import { loadNotifySettings, startNotifier } from "./notify.js";
 import { pendingStore, registerPendingTools } from "./pending.js";
 import { bearerMatches, readToken } from "./token.js";
-import { registerTools } from "./tools.js";
+import { answerFollow, launchFollow, registerTools } from "./tools.js";
 
 export const HTTP_HOST = "127.0.0.1";
 export const HTTP_PORT = 47321;
@@ -268,9 +268,9 @@ function deskFactory(config: Config): () => McpServer {
   return () => {
     const server = new McpServer({ name: "claude-remote", version: "0.1.0" });
     registerTools(server, config);
-    registerLaunchTools(server, config);
+    registerLaunchTools(server, config, launchFollow(config));
     registerDeliverTool(server, config);
-    registerPendingTools(server, config);
+    registerPendingTools(server, config, pendingStore, answerFollow(config));
     return server;
   };
 }

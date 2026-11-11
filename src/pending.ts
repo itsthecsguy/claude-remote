@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { Config } from "./config.js";
 import { DeskError } from "./domain.js";
 import { logEvent } from "./log.js";
+import { briefPending } from "./brief.js";
 
 /**
  * Pending attention reported by Claude Code hooks (see `claude-remote hook`).
@@ -499,13 +500,30 @@ export function attachPending<T extends { sessionId: string; status: { value: st
   return { ...card, pending: store.list({ sessionId: card.sessionId }).slice(0, 10) };
 }
 
-const LIST_PENDING_DESCRIPTION = "List what live sessions are waiting on, as reported by the claude-remote Claude Code hooks: permission requests (tool name and a summary of the tool input), AskUserQuestion questions (question text and options), and notifications (message text and notification_type, such as idle_prompt or permission_prompt). Entries are kept in the helper's memory and in a private file in its state dir, so they survive a helper restart (restored entries are never answerable), and are cleared when the session moves on (the next prompt, tool result, or stop) or stops running. answered is true once answer_permission or answer_question has answered the entry; it then stays listed until the session moves on and needs nothing more. answerable is true while a hook is still waiting for a remote answer; answer it with answer_permission or answer_question when those tools are enabled, otherwise answer in the app or terminal. Empty when the hooks are not installed.";
+const LIST_PENDING_DESCRIPTION = "List what live sessions are waiting on, from the Claude Code hooks: permission requests, questions, and notifications, each with a requestId. An entry marked local has no hook waiting and can only be answered on the machine; the others take answer_permission or answer_question. Empty when the hooks are not installed.";
 
-const ANSWER_PERMISSION_DESCRIPTION = "Answer one pending permission request from list_pending. Requires CLAUDE_REMOTE_ALLOW_APPROVE=1 and confirm set to true. decision is allow or deny for this single request only: it never adds a permission rule, never changes the permission mode, and never edits the tool input. Deny and ask rules in the session's settings still apply after an allow. message is passed to Claude with a deny. Fails when no hook is waiting any more (the request timed out to the normal prompt, or was answered locally). The message is not logged.";
+const ANSWER_PERMISSION_DESCRIPTION = "Allow or deny one pending permission request. confirm must be true. The decision covers this request only and adds no rule; deny rules in the session settings still apply. message goes to Claude with a deny. Fails when no hook is waiting any more.";
 
-const ANSWER_QUESTION_DESCRIPTION = "Answer one pending AskUserQuestion request from list_pending. Requires CLAUDE_REMOTE_ALLOW_APPROVE=1 and confirm set to true. answers maps each question's exact text to the chosen option label (join several labels with commas for a multi-select question, or give free text). Every question in the request must be answered. Fails when no hook is waiting any more. Answers are not logged.";
+const ANSWER_QUESTION_DESCRIPTION = "Answer one pending question. confirm must be true. answers maps each question's exact text to an option label (join labels with commas for multi-select, or give free text). Every question must be answered. Fails when no hook is waiting any more.";
 
-export function registerPendingTools(server: McpServer, config: Config, store: PendingStore = pendingStore): void {
+const FOLLOW_NOTE = " Then waits as wait_session does and returns that view, so no separate wait call is needed unless timedOut is true.";
+
+/** follow, when given, runs after a successful answer and its result is merged into the answer. */
+export function registerPendingTools(
+  server: McpServer,
+  config: Config,
+  store: PendingStore = pendingStore,
+  follow?: (sessionId: string) => Promise<object>,
+): void {
+  const brief = config.detail === "brief";
+  const followed = async (sessionId: string, answer: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    if (!follow) return answer;
+    try {
+      return { ...answer, ...(await follow(sessionId)) };
+    } catch {
+      return answer;
+    }
+  };
   server.registerTool(
     "list_pending",
     {
@@ -516,14 +534,17 @@ export function registerPendingTools(server: McpServer, config: Config, store: P
       const filter = args.sessionId ? { sessionId: args.sessionId.toLowerCase() } : undefined;
       const pending = store.list(filter);
       logEvent({ tool: "list_pending", evidence: `count-${pending.length}` });
-      return { content: [{ type: "text", text: JSON.stringify({ pending, approveEnabled: config.allowApprove }) }] };
+      const view = brief
+        ? { pending: briefPending(pending, true), ...(config.allowApprove ? {} : { approveEnabled: false }) }
+        : { pending, approveEnabled: config.allowApprove };
+      return { content: [{ type: "text", text: JSON.stringify(view) }] };
     },
   );
   if (!config.allowApprove) return;
   server.registerTool(
     "answer_permission",
     {
-      description: ANSWER_PERMISSION_DESCRIPTION,
+      description: follow ? ANSWER_PERMISSION_DESCRIPTION + FOLLOW_NOTE : ANSWER_PERMISSION_DESCRIPTION,
       inputSchema: z.object({
         sessionId: z.string(),
         requestId: z.string(),
@@ -535,7 +556,8 @@ export function registerPendingTools(server: McpServer, config: Config, store: P
     async (args) => {
       try {
         const result = await answerPermission(config, args, store);
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        const view = brief ? await followed(args.sessionId, briefAnswer(result.decision, result.disposition)) : result;
+        return { content: [{ type: "text", text: JSON.stringify(view) }] };
       } catch (error) {
         return answerError(error);
       }
@@ -544,7 +566,7 @@ export function registerPendingTools(server: McpServer, config: Config, store: P
   server.registerTool(
     "answer_question",
     {
-      description: ANSWER_QUESTION_DESCRIPTION,
+      description: follow ? ANSWER_QUESTION_DESCRIPTION + FOLLOW_NOTE : ANSWER_QUESTION_DESCRIPTION,
       inputSchema: z.object({
         sessionId: z.string(),
         requestId: z.string(),
@@ -555,12 +577,18 @@ export function registerPendingTools(server: McpServer, config: Config, store: P
     async (args) => {
       try {
         const result = await answerQuestion(config, args, store);
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        const view = brief ? await followed(args.sessionId, briefAnswer("answered", result.disposition)) : result;
+        return { content: [{ type: "text", text: JSON.stringify(view) }] };
       } catch (error) {
         return answerError(error);
       }
     },
   );
+}
+
+/** accepted means the answer is stored and the hook has not collected it yet; delivered is the normal case and is left out. */
+function briefAnswer(answer: string, disposition: "delivered" | "accepted"): Record<string, unknown> {
+  return disposition === "delivered" ? { answer } : { answer, disposition };
 }
 
 function answerError(error: unknown): { isError: true; content: [{ type: "text"; text: string }] } {

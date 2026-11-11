@@ -48,6 +48,7 @@ import {
 } from "./terminal.js";
 import { resultFromRecord, runStore, StreamReader, type RunResult } from "./runs.js";
 import { continueCommand, type CommandLister } from "./tools.js";
+import { briefStart } from "./brief.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -684,14 +685,22 @@ export function assertSpawnAllowed(bin: string): void {
   }
 }
 
-const NEW_SESSION_DESCRIPTION = "Start a session in a folder. Requires the launch gate. With no options it starts an interactive terminal session in tmux. worktree (true, or a name of letters, digits, dot, dash, underscore) adds --worktree. fastMode true adds --settings {\"fastMode\":true}; it is off unless set because fast mode bills extra usage. prompt starts a headless -p session instead and returns the session id and fast_mode_state from its init event; an interactive launch has no init event, so fastMode.state is null there. cloud with a task description runs claude --cloud in tmux and returns the cloud session id once printed. cloud plus environment (a ccpool_ id) runs claude -p <description> --environment <id> --output-format json. cloud does not combine with worktree, fastMode, or prompt. Sends Enter on the development-channels prompt only when acceptDevChannelPrompt is true and the highlighted line is the accept option. Does not answer workspace trust, a new MCP server prompt, or the Chrome extension prompt. No permission-bypass flag is ever passed.";
+const NEW_SESSION_DESCRIPTION = "Start a session in folder. With prompt it runs headless (claude -p) and returns the session id; without one it opens an interactive tmux session. worktree (true or a name) adds --worktree. fastMode true turns on fast mode, which bills extra usage. cloud (a task description, optionally with environment, a ccpool_ id) starts a cloud session and does not combine with worktree, fastMode, or prompt. acceptDevChannelPrompt true accepts the development-channels prompt; no other startup dialog is answered. No permission-bypass flag is passed.";
 
-export function registerLaunchTools(server: McpServer, config: Config): void {
+const NEW_SESSION_FOLLOW_NOTE = " With prompt, it then waits as wait_session does and returns that view with the session id; call wait_session only when timedOut is true.";
+
+/** follow, when given, runs after a headless start and its result is returned with the session id. */
+export function registerLaunchTools(
+  server: McpServer,
+  config: Config,
+  follow?: (sessionId: string, elapsedMs: number) => Promise<object>,
+): void {
   if (!config.allowLaunch) return;
+  const brief = config.detail === "brief";
   server.registerTool(
     "new_session",
     {
-      description: NEW_SESSION_DESCRIPTION,
+      description: follow ? NEW_SESSION_DESCRIPTION + NEW_SESSION_FOLLOW_NOTE : NEW_SESSION_DESCRIPTION,
       inputSchema: z.object({
         folder: z.string().min(1),
         name: z.string().min(1).max(80).optional(),
@@ -706,6 +715,7 @@ export function registerLaunchTools(server: McpServer, config: Config): void {
     },
     async (args) => {
       try {
+        const began = Date.now();
         const started = await startNew(config, {
           folder: args.folder,
           tmuxName: args.name,
@@ -719,13 +729,18 @@ export function registerLaunchTools(server: McpServer, config: Config): void {
             prompt: args.prompt,
           },
         });
-        return { content: [{ type: "text", text: JSON.stringify(started) }] };
+        if (!brief) return { content: [{ type: "text", text: JSON.stringify(started) }] };
+        if (follow && started.kind === "headless" && started.sessionId) {
+          const view = { sessionId: started.sessionId, ...(await follow(started.sessionId, Date.now() - began)) };
+          return { content: [{ type: "text", text: JSON.stringify(view) }] };
+        }
+        return { content: [{ type: "text", text: JSON.stringify(briefStart(started)) }] };
       } catch (error) {
         return launchToolError(error);
       }
     },
   );
-  server.registerTool(
+  if (config.toolset !== "core") server.registerTool(
     "continue_session",
     {
       description: "Launch a resumed terminal session. Requires the launch gate. Refuses a live owner unless confirmLiveOwner is true, and still refuses if that process is alive. Sends Enter on the development-channels prompt only when acceptDevChannelPrompt is true and the highlighted line is the accept option.",
@@ -746,7 +761,7 @@ export function registerLaunchTools(server: McpServer, config: Config): void {
           tmuxName: args.name,
           prepare: args.prepare === true,
         });
-        return { content: [{ type: "text", text: JSON.stringify(started) }] };
+        return { content: [{ type: "text", text: JSON.stringify(brief ? briefStart(started) : started) }] };
       } catch (error) {
         return launchToolError(error);
       }
